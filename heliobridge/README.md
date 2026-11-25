@@ -1,55 +1,44 @@
-# Heliobridge for Home Assistant OS
+# Heliobridge – Home Assistant OS App
 
-A Home Assistant OS app packaging of [Heliobridge](https://github.com/longsleep/heliobridge),
-a local TLS/MQTT bridge for the Growatt NEXA 2000.
+Diese App paketiert die Originalsoftware [Heliobridge von Simon Eisenmann](https://github.com/longsleep/heliobridge) für Home Assistant OS.
 
-**App package version:** `0.9.1.1`  
-**Bundled upstream source version:** `0.9.1`  
-**Supported architecture:** `amd64`
+Sie stellt eine lokale TLS-/MQTT-Bridge für den Growatt NEXA 2000 bereit und veröffentlicht Gerätedaten über den Home-Assistant-MQTT-Dienst und MQTT Discovery.
 
-> This repository is an independent Home Assistant OS packaging project. It is not affiliated
-> with or endorsed by Growatt or by the upstream Heliobridge author. The upstream software's
-> original notices and Apache-2.0 license are retained in `heliobridge/heliobridge-source/`.
+## Voraussetzungen
 
-## Add this repository to Home Assistant
+- Home Assistant OS mit Supervisor auf der in `config.yaml` aufgeführten Architektur `amd64`.
+- Installierter und laufender Home-Assistant-MQTT-Dienst.
+- Netzwerkverbindung vom NEXA-Datenlogger zum Home-Assistant-Host auf TCP-Port `7006`.
 
-[![Open your Home Assistant instance and show the add app repository dialog](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/braumandl/heliobridge-haos)
+## Installation
 
-Or add the repository manually:
+1. Das Repository `https://github.com/braumandl/heliobridge-haos` zum Home-Assistant-App-Store hinzufügen.
+2. Die App **Heliobridge** auswählen und installieren.
+3. Konfiguration prüfen und App starten.
+4. App-Protokoll auf MQTT-Verbindung und Start des TLS-Listeners prüfen.
 
-1. Open **Settings → Apps**.
-2. Open the menu in the top-right corner and select **Repositories**.
-3. Add `https://github.com/braumandl/heliobridge-haos`.
-4. Find **Heliobridge** in the app store and install it.
+Die Heliobridge Updater-App ist eine separate optionale App und muss bei Bedarf zusätzlich installiert werden.
 
-The Supervisor builds the app from the included `Dockerfile`; no prebuilt image is configured
-in this repository. The build therefore depends on the build environment and availability of
-the referenced base images and build dependencies.
+## Optionen
 
-## What this app does
+| Option | Standardwert | Bedeutung |
+|---|---:|---|
+| `allow_writes` | `false` | Schreibende Steuerbefehle erlauben |
+| `allow_power_plus` | `false` | Power+-Schreibfunktionen aktivieren |
+| `cloud_relay` | `false` | Growatt-Cloud-Relay aktivieren |
+| `relay_mode` | `controls` | Relay-Modus: `full`, `controls` oder `observer` |
+| `allow_from` | leer | Optionale Quell-IP-/Netzwerk-Allowlist |
+| `allow_devices` | leer | Optionale Allowlist von Geräte-Seriennummern |
+| `slots` | `1` | Anzahl der Zeitplan-Slots (1–9) |
+| `offline_after` | `30` | Sekunden ohne Telemetrie bis offline |
+| `mqtt_base` | `heliobridge` | MQTT-Basis-Topic |
+| `mqtt_discovery_prefix` | `homeassistant` | MQTT-Discovery-Präfix |
+| `timezone` | `Europe/Berlin` | Zeitzone |
+| `log_level` | `info` | Protokollierungsstufe |
 
-- Listens for the NEXA datalogger's TLS/MQTT connection on TCP port `7006`.
-- Publishes device data to the Home Assistant MQTT service.
-- Uses MQTT Discovery with the configured discovery prefix.
-- Stores persistent bridge state under the app's `/data` directory.
-- Starts with MQTT writes, Power+ writes, and cloud relay disabled.
+### Sicherheitsdefaults
 
-The app requires the Home Assistant MQTT service. A compatible MQTT app/service must be
-installed and running.
-
-## Network setup
-
-The upstream project documents two ways to direct the NEXA datalogger to the local bridge:
-a LAN DNS override for `mqtt.growatt.com` pointing to the Home Assistant host, or a
-destination-NAT rule forwarding the relevant traffic to that host on TCP port `7006`.
-
-This package does not change the NEXA endpoint registers. Do not change DNS or NAT until the
-app is installed, starts successfully, and its MQTT connection to Home Assistant is healthy.
-The device's network path must permit it to reach the Home Assistant host on TCP `7006`.
-
-## Security defaults
-
-The app defaults to:
+Die schreibenden Funktionen und das Cloud-Relay sind standardmäßig deaktiviert:
 
 ```yaml
 allow_writes: false
@@ -57,41 +46,26 @@ allow_power_plus: false
 cloud_relay: false
 ```
 
-The two connection allowlists (`allow_from` and `allow_devices`) are empty by default. In the
-bundled upstream software, an empty allowlist admits all connecting addresses or device serials.
-Configure them if you need to restrict access; do not interpret an empty value as deny-all.
+Leere Werte bei `allow_from` und `allow_devices` bedeuten im gebündelten Upstream-Code, dass anhand dieser Listen keine Einschränkung vorgenommen wird. Leere Listen sind daher keine Deny-all-Sperre.
 
-## Documentation
+## Netzwerkumleitung
 
-- [App installation, configuration and network setup](heliobridge/README.md)
-- [App documentation](heliobridge/DOCS.md)
-- [Changelog](heliobridge/CHANGELOG.md)
-- [Build verification scope](heliobridge/BUILD-VERIFICATION.md)
+Der NEXA-Datenlogger muss auf die lokale Bridge umgeleitet werden. Das Upstream-Projekt dokumentiert:
 
-## Versioning
+- DNS-Override für `mqtt.growatt.com` auf die IP-Adresse des Home-Assistant-Hosts, oder
+- Destination-NAT auf den Home-Assistant-Host und TCP-Port `7006`.
 
-The Home Assistant app package and the bundled upstream application use separate version
-numbers. Update both deliberately when preparing a new release:
-- App package: `heliobridge/config.yaml`
-- Upstream source: `heliobridge/heliobridge-source/Cargo.toml`
+Die App richtet diese Netzwerkregeln nicht selbst ein und verändert keine NEXA-Endpoint-Register. Richte DNS/NAT erst ein, nachdem die App startet und ihre MQTT-Verbindung erfolgreich hergestellt hat.
 
-## Support and attribution
+## Diagnose
 
-For upstream Heliobridge software issues, consult the
-[upstream project](https://github.com/longsleep/heliobridge). For packaging-specific issues,
-use the Issues tab of this repository.
+- MQTT-Verbindung im App-Protokoll kontrollieren.
+- Prüfen, ob TCP-Port `7006` lauscht.
+- Prüfen, ob der NEXA-Datenlogger tatsächlich eine TLS-Verbindung aufbaut.
+- MQTT Discovery und das konfigurierte Discovery-Präfix kontrollieren.
 
-Growatt and NEXA are trademarks of their respective owners. This project is an independent
-integration and is not an official Growatt product.
+Ein erfolgreicher TCP-Watchdog-Test bestätigt nur, dass der Listener erreichbar ist. Er beweist nicht, dass ein NEXA-Gerät verbunden ist oder gültige Telemetrie und MQTT-Discovery-Daten veröffentlicht werden.
 
-## Automatic upstream updates
+## Zurück zur Growatt-Cloud
 
-GitHub Actions checks the original author's stable releases at
-[longsleep/heliobridge](https://github.com/longsleep/heliobridge) every six hours.
-A new upstream source release is mirrored automatically into this repository,
-including the matching HAOS app version. The optional Heliobridge Updater then
-asks the Home Assistant Supervisor to install the new repository version.
-No manual source upload by the repository maintainer is required for upstream releases.
-
-See [`heliobridge-updater/README.md`](heliobridge-updater/README.md) and
-[`.github/workflows/sync-upstream.yml`](.github/workflows/sync-upstream.yml).
+Die App stoppen und den eingerichteten DNS-Override für `mqtt.growatt.com` bzw. die Destination-NAT-Regel entfernen. Dieses Paket verändert keine NEXA-Endpoint-Register.
