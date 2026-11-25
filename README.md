@@ -83,3 +83,28 @@ use the Issues tab of this repository.
 
 Growatt and NEXA are trademarks of their respective owners. This project is an independent
 integration and is not an official Growatt product.
+
+## Automatic upstream updates
+
+GitHub Actions checks the original author's stable releases at
+[longsleep/heliobridge](https://github.com/longsleep/heliobridge) every six hours.
+A new upstream source release is mirrored automatically into this repository,
+including the matching HAOS app version. The optional Heliobridge Updater then
+asks the Home Assistant Supervisor to install the new repository version.
+No manual source upload by the repository maintainer is required for upstream releases.
+
+See [`heliobridge-updater/README.md`](heliobridge-updater/README.md) and
+[`.github/workflows/sync-upstream.yml`](.github/workflows/sync-upstream.yml).
+
+
+## Upstream synchronization
+
+The workflow reads stable semantic-version Git tags (`X.Y.Z` or `vX.Y.Z`) from
+`longsleep/heliobridge` using the GitHub Tags API. It does not use the
+`/releases/latest` endpoint. The source archive's `Cargo.toml` version must
+match the selected tag before any repository files are replaced.
+
+The separate updater uses the documented Supervisor V1 app endpoints
+(`/addons` and `/store/addons`). If more than one installed app has the exact
+name `Heliobridge`, set `app_slug` in the updater options to the exact slug
+shown by Supervisor. It deliberately stops rather than guessing.
