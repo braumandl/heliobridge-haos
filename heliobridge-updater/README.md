@@ -1,82 +1,84 @@
 # Heliobridge Updater
 
-Der Heliobridge Updater ist eine eigenständige Home-Assistant-OS-App. Er prüft den Home-Assistant-App-Store regelmäßig auf eine neuere Version der Heliobridge-App und kann ein Update über den Supervisor anfordern.
+[English](README.md) · [Deutsch](README.de.md)
 
-Die Upstream-Software wird von Simon Eisenmann entwickelt:
+Heliobridge Updater is a standalone Home Assistant OS app. It periodically checks the Home Assistant app store for a newer version of the Heliobridge app and can request an update through the Supervisor.
+
+The upstream software is developed by Simon Eisenmann:
 https://github.com/longsleep/heliobridge
 
 ## Installation
 
-1. Zuerst das Repository `https://github.com/braumandl/heliobridge-haos` zum Home-Assistant-App-Store hinzufügen.
-2. Die App **Heliobridge** installieren und einrichten.
-3. Zusätzlich die App **Heliobridge Updater** aus demselben Repository installieren.
-4. Den Updater starten und sein Protokoll kontrollieren.
+1. Add the repository `https://github.com/braumandl/heliobridge-haos` to the Home Assistant app store.
+2. Install and configure the **Heliobridge** app.
+3. Also install **Heliobridge Updater** from the same repository.
+4. Start the updater and check its log.
 
-Der Updater wird nicht automatisch mit der Heliobridge installiert. Beide Apps sind getrennte Installationen.
+The updater is not installed automatically with Heliobridge. The two apps are separate installations.
 
-## Automatische Updatekette
+## Automatic update chain
 
-Die Updatekette besteht aus zwei unabhängigen Schritten:
+The update chain consists of two independent steps:
 
-1. GitHub Actions prüft alle sechs Stunden die Git-Tags des Originalprojekts `longsleep/heliobridge`.
-2. Das Synchronisierungsskript wählt den höchsten stabilen semantischen Versions-Tag im Format `X.Y.Z` bzw. `vX.Y.Z`. Vorabversionen mit Suffix werden nicht berücksichtigt.
-3. Vor der Übernahme wird geprüft, ob die Versionsnummer in der Upstream-`Cargo.toml` mit dem ausgewählten Tag übereinstimmt.
-4. Bei einer neuen Version aktualisiert GitHub Actions den gebündelten Quellcode und die HAOS-App-Paketversion in diesem Repository und erstellt einen Commit.
-5. Der Updater lädt den HAOS-App-Store neu und vergleicht die installierte Version mit der im Store verfügbaren Version.
-6. Wenn eine neuere Version verfügbar ist und automatische Updates aktiviert sind, fordert der Updater das Supervisor-Update an. Standardmäßig wird dabei ein Backup angefordert.
+1. GitHub Actions checks the Git tags of the upstream project `longsleep/heliobridge` every six hours.
+2. The synchronization script selects the highest stable semantic version tag in the format `X.Y.Z` or `vX.Y.Z`. Prerelease versions with a suffix are ignored.
+3. Before importing the source, the script checks that the version in the upstream `Cargo.toml` matches the selected tag.
+4. If a new version is available, GitHub Actions updates the bundled source code and the HAOS app package version in this repository and creates a commit.
+5. The updater reloads the HAOS app store and compares the installed version with the version available in the store.
+6. If a newer version is available and automatic updates are enabled, the updater requests the Supervisor update. A backup is requested by default.
 
-GitHub Actions verwendet den Repository-`GITHUB_TOKEN` für den authentifizierten Zugriff auf die GitHub-API. Es ist kein persönlicher GitHub-Token in der App-Konfiguration erforderlich.
+GitHub Actions uses the repository's `GITHUB_TOKEN` for authenticated access to the GitHub API. No personal GitHub token is required in the app configuration.
 
-## Konfiguration
+## Configuration
 
-Die aktuell in `config.yaml` definierten Optionen:
+The options currently defined in `config.yaml` are:
 
-| Option | Standardwert | Bedeutung |
-|---|---|---|
-| `app_name` | `Heliobridge` | Name der Ziel-App |
-| `app_slug` | `d166b643_heliobridge` | Vollständiger Supervisor-Slug der Ziel-App aus diesem Repository |
-| `check_interval_hours` | `12` | Prüfintervall in Stunden |
-| `backup_before_update` | `true` | Vor dem Update ein Backup anfordern |
-| `auto_update` | `true` | Ein verfügbares Update automatisch anfordern |
+| Option | Default | Description |
+|---|---:|---|
+| `app_name` | `Heliobridge` | Target app name |
+| `app_slug` | `d166b643_heliobridge` | Full Supervisor slug of the target app in this repository |
+| `check_interval_hours` | `12` | Check interval in hours |
+| `backup_before_update` | `true` | Request a backup before updating |
+| `auto_update` | `true` | Automatically request an available update |
 
-Wenn der Supervisor-Slug deiner Heliobridge-Installation abweicht, muss `app_slug` auf den tatsächlichen vollständigen Slug angepasst werden. Bei mehreren Heliobridge-Installationen sollte die Ziel-App ausdrücklich über ihren Slug festgelegt werden.
+If the Supervisor slug of your Heliobridge installation is different, set `app_slug` to the actual full slug. If multiple Heliobridge installations exist, explicitly select the target app by its slug.
 
-## Netzwerk- und Berechtigungsbedarf
+## Network and permissions
 
-Der Updater benötigt keine LAN-IP-Adresse und keinen festen Installationspfad. Er kommuniziert über den internen Supervisor-Dienst `http://supervisor` und die von Home Assistant bereitgestellte Variable `SUPERVISOR_TOKEN`.
+The updater does not require a LAN IP address or a fixed installation path. It communicates through the internal Supervisor service `http://supervisor` and the `SUPERVISOR_TOKEN` variable provided by Home Assistant.
 
-Die App-Metadaten weisen dem Updater die Supervisor-Manager-Rolle zu. Diese Berechtigung wird benötigt, um den Store neu zu laden und das Update der Ziel-App anzufordern.
+The app metadata assigns the Supervisor Manager role to the updater. This permission is required to reload the store and request an update of the target app.
 
-## Protokoll prüfen
+## Check the log
 
-Im Updater-Protokoll werden unter anderem ausgegeben:
+The updater log reports, among other things:
 
-- Start und Prüfintervall
-- erkannte Ziel-App und Supervisor-Slug
-- installierte Version und verfügbare Store-Version
-- Ergebnis der Updateprüfung
-- Ergebnis eines angeforderten Updates
+- startup and check interval,
+- detected target app and Supervisor slug,
+- installed version and available store version,
+- result of the update check,
+- result of a requested update.
 
-Beispiel für einen Zustand ohne verfügbares Update:
+Example of a state where no update is available:
 
 ```text
-[Heliobridge Updater] Updater gestartet. Prüfintervall: 12 Stunde(n).
-[Heliobridge Updater] Ziel-App: Heliobridge (d166b643_heliobridge)
-[Heliobridge Updater] Installiert: 0.9.1.1; Repository: 0.9.1.1
-[Heliobridge Updater] Heliobridge ist aktuell; kein Update erforderlich.
+[Heliobridge Updater] Updater started. Check interval: 12 hour(s).
+[Heliobridge Updater] Target app: Heliobridge (d166b643_heliobridge)
+[Heliobridge Updater] Installed: 0.9.1.1; Repository: 0.9.1.1
+[Heliobridge Updater] Heliobridge is up to date; no update required.
 ```
 
-## Teststatus und Grenzen
+## Test status and limitations
 
-Der Updater wurde auf einer HAOS-Installation gestartet. Das Protokoll hat die Ziel-App erkannt und den Versionsvergleich bei identischer installierter und verfügbarer Version erfolgreich durchgeführt.
+The updater has been started on a HAOS installation. Its log identified the target app and successfully compared the installed and available versions when they were identical.
 
-Ein vollständiger Versionssprung mit einer neueren Upstream-Version und der anschließenden Installation durch den Supervisor ist noch nicht als Ende-zu-Ende-Test nachgewiesen. Ein erfolgreicher Versionsvergleich ohne Update ersetzt diesen Integrationstest nicht.
+A complete version change using a newer upstream version followed by installation through the Supervisor has not yet been demonstrated as an end-to-end test. A successful version comparison without an update does not replace this integration test.
 
-Ein erfolgreiches GitHub-Actions-Synchronisierungsergebnis bedeutet außerdem zunächst nur, dass die Upstream-Version geprüft bzw. in das Repository übernommen wurde. Der HAOS-Supervisor muss die neue App-Version anschließend im Store erkennen können.
+Likewise, a successful GitHub Actions synchronization initially means only that the upstream version was checked or imported into the repository. The HAOS Supervisor must subsequently detect the new app version in the store.
 
-## Fehlerdiagnose
+## Troubleshooting
 
-- **Ziel-App nicht gefunden:** Den vollständigen Supervisor-Slug in `app_slug` prüfen.
-- **Keine neue Store-Version:** Den GitHub-Actions-Workflow und anschließend die Aktualisierung des HAOS-App-Stores prüfen.
-- **Update wird nicht angefordert:** `auto_update` und den Updater-Log prüfen.
-- **Backup oder Supervisor-Update schlägt fehl:** Supervisor-Protokoll und verfügbaren Speicherplatz prüfen.
+- **Target app not found:** Check the full Supervisor slug in `app_slug`.
+- **No new store version:** Check the GitHub Actions workflow and then refresh the HAOS app store.
+- **Update is not requested:** Check `auto_update` and the updater log.
+- **Backup or Supervisor update fails:** Check the Supervisor log and available storage.
