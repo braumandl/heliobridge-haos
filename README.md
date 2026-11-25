@@ -229,6 +229,22 @@ Weitere technische Informationen:
 - [Updater-Dokumentation](heliobridge-updater/DOCS.md)
 - [Updater-README](heliobridge-updater/README.md)
 
+## Projektstatus und Mitarbeit
+
+**Dieses Repository wird derzeit nicht aktiv weiterentwickelt oder dauerhaft gepflegt.** Es wird in der vorhandenen Form zur Verfügung gestellt; eine regelmäßige Betreuung, zeitnahe Fehlerbehebung oder Weiterentwicklung kann nicht zugesagt werden.
+
+Das Projekt ist ausdrücklich offen für Mitwirkende und eine Übernahme der Pflege. Wer die Apps, die Upstream-Synchronisierung oder die Dokumentation weiter betreuen möchte, ist willkommen. Dazu gehören beispielsweise:
+
+- Fehler prüfen und beheben,
+- Kompatibilität mit neuen Home-Assistant-OS- bzw. Supervisor-Versionen testen,
+- die automatische Upstream-Synchronisierung und den Updater warten,
+- Dokumentation ergänzen und aktualisieren,
+- gemeinsam die Verantwortung für Releases und Support übernehmen.
+
+Interessierte können sich über **GitHub Issues** oder **Pull Requests** melden. Wer eine aktivere Rolle übernehmen und die Pflege dauerhaft mittragen möchte, kann dies in einem Issue ausdrücklich ansprechen. Eine gemeinsame Weiterführung oder Übergabe ist willkommen.
+
+Bitte beachte: Ohne aktive Maintainer können Issues und Pull Requests möglicherweise unbeantwortet bleiben.
+
 ## Originalprojekt und Lizenzhinweise
 
 Die Heliobridge selbst stammt von Simon Eisenmann:
