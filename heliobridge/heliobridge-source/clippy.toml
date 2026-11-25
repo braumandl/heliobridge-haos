@@ -1,0 +1,45 @@
+# Keep in step with rust-version in Cargo.toml so clippy does not suggest APIs
+# newer than the declared minimum.
+msrv = "1.97"
+
+# Pre-1.0, so restructuring public types is not a breaking change to warn about.
+avoid-breaking-exported-api = false
+
+# The strict panic/index lints are about the daemon's runtime behaviour. In tests,
+# unwrap and indexing are how you write a readable assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Protocol acronyms that appear throughout the documentation. Without these, `doc_markdown` demands
+# backticks around every one of them, which makes prose about a protocol unreadable. `".."` extends
+# clippy's own list rather than replacing it.
+doc-valid-idents = [
+    "..",
+    "QoS",
+    "MQTT",
+    "CONNECT",
+    "CONNACK",
+    "SUBSCRIBE",
+    "SUBACK",
+    "PUBLISH",
+    "PUBACK",
+    "PINGREQ",
+    "PINGRESP",
+    "DISCONNECT",
+    "TLS",
+    "SNI",
+    "CRC",
+    "DNS",
+    "EEPROM",
+    "Modbus",
+    "Growatt",
+    "GroBro",
+    "NEXA",
+    "LoRa",
+    "LoRaWAN",
+    "LLCC68",
+    "GFSK",
+    "mDNS",
+]

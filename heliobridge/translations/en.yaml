@@ -1,0 +1,39 @@
+configuration:
+  allow_writes:
+    name: Allow writes
+    description: Enable Heliobridge setting commands. Disabled by default.
+  allow_power_plus:
+    name: Allow Power+
+    description: Enable the Power+ setting. Disabled by default.
+  cloud_relay:
+    name: Cloud relay
+    description: Relay NEXA traffic to Growatt Cloud. Disabled by default.
+  relay_mode:
+    name: Cloud relay mode
+    description: Authority retained by Growatt Cloud when cloud relay is enabled.
+  allow_from:
+    name: Allowed source networks
+    description: Optional comma-separated IP addresses or CIDRs allowed to connect.
+  allow_devices:
+    name: Allowed device serials
+    description: Optional comma-separated NEXA serial numbers allowed to connect.
+  slots:
+    name: Schedule slots
+    description: Number of the nine schedule slots to expose.
+  offline_after:
+    name: Device offline timeout
+    description: Seconds without telemetry before the device is unavailable.
+  mqtt_base:
+    name: MQTT base topic
+    description: Root topic for Heliobridge MQTT topics.
+  mqtt_discovery_prefix:
+    name: MQTT discovery prefix
+    description: Discovery topic root watched by Home Assistant.
+  timezone:
+    name: Time zone
+    description: Local wall-clock zone sent to the NEXA.
+  log_level:
+    name: Log filter
+    description: Heliobridge tracing filter, for example info or debug.
+network:
+  7006/TCP: NEXA 2000 MQTT-over-TLS listener

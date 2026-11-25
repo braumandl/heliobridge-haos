@@ -1,0 +1,1799 @@
+//! Which Home Assistant entity each register becomes.
+//!
+//! Almost nothing here is a table. The register maps already say what a setting accepts — a range with
+//! bounds, a flag, a time of day, a set of labels — and that is exactly what decides the component and its
+//! configuration, so the mapping is derived. A parallel table would be a second place to add a register
+//! to, and would eventually disagree with the first.
+//!
+//! What cannot be derived is the handful of judgements Home Assistant needs and the protocol does not
+//! have: which quantity a unit represents, whether a reading accumulates or is instantaneous, whether an
+//! entity belongs on the dashboard or in the diagnostics block, and where a bare register name would
+//! understate what a switch does.
+
+use core::fmt;
+use std::collections::HashSet;
+
+use crate::driver::catalogue::{Catalogue as Registers, Measurement, Setting as SettingInfo, Shape as Control};
+use crate::homeassistant::command::Permitted;
+use crate::model::{Scaling, Unit};
+
+/// The Home Assistant component an entity is published as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Component {
+    /// A numeric reading.
+    Sensor,
+    /// An on/off reading.
+    BinarySensor,
+    /// A numeric setting.
+    Number,
+    /// An on/off setting.
+    Switch,
+    /// A setting chosen from a fixed set.
+    Select,
+    /// A free-text setting, used where there is no better component.
+    Text,
+    /// A momentary action.
+    Button,
+}
+
+impl Component {
+    /// The name Home Assistant knows it by, which is also its place in the discovery topic.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sensor => "sensor",
+            Self::BinarySensor => "binary_sensor",
+            Self::Number => "number",
+            Self::Switch => "switch",
+            Self::Select => "select",
+            Self::Text => "text",
+            Self::Button => "button",
+        }
+    }
+}
+
+impl fmt::Display for Component {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where an entity appears on the device page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    /// A setting: the configuration block rather than the dashboard.
+    Config,
+    /// Something about the equipment rather than the energy: versions, signal strength, connectivity.
+    Diagnostic,
+}
+
+impl Category {
+    /// The value of `entity_category`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+}
+
+/// How a value behaves over time, for long-term statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateClass {
+    /// An instantaneous reading.
+    Measurement,
+    /// A counter that only rises, apart from resets the recorder handles.
+    TotalIncreasing,
+}
+
+impl StateClass {
+    /// The value of `state_class`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measurement => "measurement",
+            Self::TotalIncreasing => "total_increasing",
+        }
+    }
+}
+
+/// Which topic carries an entity's state.
+///
+/// Three, because they are published on three different schedules: telemetry every few seconds from the
+/// device, settings when one changes or is read back, and status whenever this bridge's *opinion* of the
+/// device changes. The last has to keep being published when the first stops, which is the whole reason it
+/// is not a field inside the telemetry object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A decoded telemetry frame.
+    Telemetry,
+    /// Holding-register values, as last read back.
+    Settings,
+    /// What this bridge knows about the device rather than from it.
+    Status,
+    /// Datalogger configuration, from the identity report the device sends on connect.
+    ///
+    /// A fourth address space rather than a fourth flavour of the same one, and mostly not entity
+    /// material: most of it is static, inert, or identifying. The handful published here are the ones
+    /// that change and mean something.
+    ///
+    /// **Only a register the device volunteers may become an entity.** Most of the config space answers
+    /// an explicit read and nothing else, so an entity built on one would sit unknown until somebody
+    /// asked — announcing something Home Assistant can never fill in on its own. A test below holds this.
+    Config,
+}
+
+/// What an entity's availability depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// This program running *and* the device reporting. Everything that carries a reading or a setting:
+    /// there is no honest value for one of these while the device is away.
+    Device,
+    /// This program running, whatever the device is doing. Only for the entities whose job is to report
+    /// that the device is away — listing the device's own availability would make them disappear at the
+    /// moment they became worth reading.
+    Bridge,
+}
+
+/// A condition, beyond the device reporting at all, under which an entity has no honest value.
+///
+/// Availability rather than a state: these are entities whose value would otherwise look perfectly
+/// ordinary while meaning nothing. A superseded setting reads back exactly what was written to it, and a
+/// meter reading of `0` looks like a measurement — so in both cases nothing in the value itself reveals
+/// that it is inert, and going unavailable is the only way to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Available only while another *setting* holds none of `values`.
+    SettingIsNot {
+        /// The setting that decides.
+        setting: &'static str,
+        /// The values under which this entity is inert.
+        values: &'static [u16],
+    },
+    /// Available only while a *telemetry* reading is non-zero.
+    ReadingIsSet {
+        /// The reading that decides.
+        reading: &'static str,
+    },
+}
+
+/// The assembled six-field firmware version.
+pub const FIRMWARE_VERSION: &str = "firmware_version";
+
+/// The two readings that carry the component versions, published as one assembled string instead.
+///
+/// Each holds two components in its octets, so on their own they are a number nobody can read: 3596 means
+/// "inverter 14, MPPT 12". Publishing them would put two undecodable diagnostics on the page beside the
+/// version they compose.
+const VERSION_PARTS: [&str; 2] = ["inverter_mppt_version", "pd_bms_version"];
+
+/// When the last telemetry frame arrived, which does not exist until one has.
+pub const LAST_UPDATE: &str = "last_update";
+
+/// The difference between the highest and lowest cell, which the device does not report as such.
+pub const CELL_SPREAD: &str = "battery_cell_spread";
+
+/// The lowest cell's voltage, measured while the pack was doing nothing.
+pub const RESTING_VOLTAGE: &str = "battery_resting_cell_voltage";
+
+/// Whether the reported state of charge is credible against that resting voltage.
+pub const SOC_CREDIBLE: &str = "battery_soc_credible";
+
+/// The reading that says whether the device currently has a meter reporting.
+pub const METER_CONNECTED: &str = "meter_connected";
+
+/// The reading that says whether the device is actually running off-grid, as against told to.
+pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
+
+/// The BMS's heater state: one bit per pack, set while that pack's heater is energised.
+pub const HEATER_STATE: &str = "battery_heater_state";
+
+/// The control that supplies a meter reading to the device.
+pub const METER_READING: &str = "supplied_meter_reading";
+
+/// The control that withdraws it.
+pub const WITHDRAW_METER_READING: &str = "withdraw_meter_reading";
+
+/// The control that opens a pairing window on the device's LoRa radio.
+///
+/// Named for the transport because it is one of two ways this device gains an accessory, and the other — a
+/// search of the local network — is a different operation that would need its own control. `lora` rather
+/// than `radio`: this unit has three radios, so `radio` would name none of them.
+///
+/// This key becomes part of the entity's `unique_id`, so changing it orphans the entity in anyone's Home
+/// Assistant. It is settled before the first release for that reason and should not move afterwards.
+pub const PAIR_LORA_ACCESSORY: &str = "pair_lora_accessory";
+
+/// What a numeric control accepts.
+///
+/// Signed, though every *setting* the device holds is unsigned: a supplied meter reading is a signed
+/// quantity, since export is negative, and it is published as a number like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// Smallest accepted value.
+    pub min: i32,
+    /// Largest accepted value.
+    pub max: i32,
+}
+
+/// The parts of an entity that differ by component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shape {
+    /// A reading, with how it behaves over time.
+    Reading(Option<StateClass>),
+    /// A word of flags, rendered as hexadecimal.
+    ///
+    /// A bitfield is not a quantity: `0` is not a count of faults, and `1024` is not more of anything than
+    /// `512`. Hexadecimal says so at a glance, and it is what the specification's bit tables are indexed
+    /// by, so a word that appears can be looked up rather than converted first.
+    Flags,
+    /// An on/off reading, with the payloads that mean each.
+    Signal {
+        /// Payload meaning on.
+        on: &'static str,
+        /// Payload meaning off.
+        off: &'static str,
+    },
+    /// A numeric setting and its bounds.
+    Numeric(Bounds),
+    /// An on/off setting.
+    Toggle,
+    /// A setting chosen from labels.
+    Choice(&'static [&'static str]),
+    /// A reading that is always one of a fixed set of labels — what a [`Shape::Choice`] becomes where it may
+    /// not be written. Home Assistant shows it as an `enum` sensor, which knows the set in advance.
+    Labelled(&'static [&'static str]),
+    /// A time of day, `HH:MM`.
+    TimeOfDay,
+    /// The days a schedule slot repeats on, as a list or the word for every day.
+    ///
+    /// Its own shape rather than sharing [`Shape::TimeOfDay`]: that one publishes a `HH:MM` pattern and a
+    /// fixed length of five, which Home Assistant validates against — so a weekday list rendered through
+    /// it is rejected and the entity never leaves `unknown`.
+    Weekdays,
+    /// A momentary action.
+    Action,
+}
+
+/// One Home Assistant entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    /// Field name, unique per device. Appears in the discovery topic and in the state payload.
+    pub key: &'static str,
+    /// What a person sees.
+    pub name: String,
+    /// Which component it is published as.
+    pub component: Component,
+    /// Which quantity it measures, where Home Assistant recognises one.
+    pub device_class: Option<&'static str>,
+    /// Unit symbol, where it has one.
+    pub unit: Option<&'static str>,
+    /// Where it appears on the device page.
+    pub category: Option<Category>,
+    /// How many decimals the reading actually resolves, where it is a measurement.
+    ///
+    /// Home Assistant otherwise picks a default from the unit, and its default for volts is *none* — which
+    /// renders a cell voltage of 3.325 V as `3 V`.
+    pub precision: Option<u8>,
+    /// The component-specific part.
+    pub shape: Shape,
+    /// Which topic carries its state, or `None` for a control that has none.
+    ///
+    /// `None` makes the control *optimistic*: Home Assistant shows the value it last set, because
+    /// nothing reports the value back. Only correct where the device offers no read-back and something
+    /// else carries the truth — a supplied meter reading is reported by the device as
+    /// `meter_active_power`, so that sensor is the feedback rather than an echo of what was written.
+    pub source: Option<Source>,
+    /// What its availability depends on.
+    pub presence: Presence,
+    /// A further condition for it to be available, where it has one.
+    pub gate: Option<Gate>,
+    /// Whether Home Assistant enables it on discovery.
+    ///
+    /// `false` registers the entity and leaves it switched off, which is where a control belongs when
+    /// nothing is known to depend on it: it stays available to anyone who wants it without occupying a
+    /// place on the page.
+    pub enabled: bool,
+}
+
+impl Entity {
+    /// The entity a writable setting becomes.
+    ///
+    /// The component follows from the domain, which is the same thing the encoder validates against — so
+    /// an entity can never offer a value the device would refuse.
+    pub fn for_setting(setting: &impl SettingInfo) -> Self {
+        let (component, shape) = match setting.shape() {
+            Control::Number { min, max } => (
+                Component::Number,
+                Shape::Numeric(Bounds {
+                    min: i32::from(min),
+                    max: i32::from(max),
+                }),
+            ),
+            Control::Switch => (Component::Switch, Shape::Toggle),
+            Control::TimeOfDay | Control::Text => (Component::Text, Shape::TimeOfDay),
+            Control::Weekdays => (Component::Text, Shape::Weekdays),
+            Control::Choice { labels } => (Component::Select, Shape::Choice(labels)),
+        };
+
+        Self {
+            key: setting.name(),
+            name: label(setting.name()),
+            component,
+            device_class: None,
+            unit: symbol(setting.unit()),
+            // Every setting is configuration, so none of them clutter the dashboard.
+            category: Some(Category::Config),
+            // A setting is a whole number of watts, percent or minutes; its step carries the resolution.
+            precision: None,
+            shape,
+            source: Some(Source::Settings),
+            presence: Presence::Device,
+            enabled: !DISABLED.contains(&setting.name()),
+            gate: setting
+                .superseded_by()
+                .map(|(setting, values)| Gate::SettingIsNot { setting, values }),
+        }
+    }
+
+    /// The entity a telemetry register becomes, or `None` for one that should not be published.
+    ///
+    /// A register whose meaning is not established is not published: a value nobody can interpret is
+    /// noise on a dashboard, and it stays available through the control API for investigation.
+    pub fn for_reading(reading: &impl Measurement) -> Option<Self> {
+        if reading.is_unknown() {
+            return None;
+        }
+        // Published as the assembled version instead.
+        if VERSION_PARTS.contains(&reading.name()) {
+            return None;
+        }
+        // Text registers are the serial, split across four of them. The device already carries its serial
+        // as its identity, so publishing the pieces would add four entities saying what one already says.
+        if matches!(reading.shape(), Control::Text) {
+            return None;
+        }
+
+        // A flags word and a label share this much: neither is a quantity, so neither may carry a unit, a
+        // device class or a state class. `0` faults is not a measurement of nothing.
+        let flags = is_flags(reading.name());
+        let signal = signal_class(reading.name());
+        let numeric = !flags && signal.is_none() && matches!(reading.shape(), Control::Number { .. });
+        let device_class = numeric
+            .then(|| device_class(reading.name(), reading.unit()))
+            .flatten()
+            .or_else(|| matches!(reading.shape(), Control::Choice { .. }).then_some("enum"));
+
+        Some(Self {
+            key: reading.name(),
+            name: label(reading.name()),
+            component: if signal.is_some() {
+                Component::BinarySensor
+            } else {
+                Component::Sensor
+            },
+            device_class: signal.or(device_class),
+            unit: numeric.then(|| symbol(reading.unit())).flatten(),
+            category: diagnostic(reading.name()),
+            precision: numeric.then(|| precision(reading.scaling())),
+            shape: if flags {
+                Shape::Flags
+            } else if signal.is_some() {
+                Shape::Signal { on: "1", off: "0" }
+            } else {
+                Shape::Reading(numeric.then(|| state_class(device_class)))
+            },
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: reading.gated_by().map(|reading| Gate::ReadingIsSet { reading }),
+        })
+    }
+
+    /// Whether the device is reporting.
+    ///
+    /// One of the entities that must survive the outage it describes, hence [`Presence::Bridge`], and an
+    /// ordinary entity rather than a diagnostic for the same reason as [`Self::last_update`]: it qualifies
+    /// every reading on the page, so it belongs beside them.
+    pub fn connected() -> Self {
+        Self {
+            key: "connected",
+            name: "Device connected".to_owned(),
+            component: Component::BinarySensor,
+            device_class: Some("connectivity"),
+            unit: None,
+            category: None,
+            precision: None,
+            shape: Shape::Signal {
+                on: "online",
+                off: "offline",
+            },
+            source: Some(Source::Status),
+            presence: Presence::Bridge,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// When the most recent telemetry frame arrived.
+    ///
+    /// Answers "how stale is this?", which is the question a dashboard needs when a value looks wrong, and
+    /// it is the one thing that stays truthful while every reading is unavailable. That is why it is an
+    /// ordinary sensor rather than a diagnostic: it is read alongside the readings it qualifies.
+    pub fn last_update() -> Self {
+        Self {
+            key: LAST_UPDATE,
+            name: "Last update".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("timestamp"),
+            unit: None,
+            category: None,
+            precision: None,
+            // No state class: Home Assistant refuses one on a timestamp, and there is nothing to average.
+            shape: Shape::Reading(None),
+            source: Some(Source::Status),
+            presence: Presence::Bridge,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// Which build of this program produced the readings.
+    ///
+    /// A diagnostic, unlike the other two on the status topic: it says nothing about the energy or about
+    /// how current anything is. It is here because a device page that reports a firmware version and a
+    /// hardware version, and stays silent about the software actually doing the decoding, sends the reader
+    /// looking in the wrong place. Every field on that page is this program's interpretation of a register.
+    ///
+    /// [`Presence::Bridge`] for the obvious reason: it describes the bridge, so a device that has gone away
+    /// has no bearing on whether it is true.
+    pub fn bridge_version() -> Self {
+        Self {
+            key: "bridge_version",
+            // Named for the program rather than "Bridge version", which on a page full of the *device's*
+            // versions would read as another of them.
+            name: "Heliobridge version".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Status),
+            presence: Presence::Bridge,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// How strong the datalogger's Wi-Fi is, in dBm.
+    ///
+    /// Config register 76, which the device volunteers on every connect, so this costs no traffic. Verified
+    /// against the vendor's own web interface, which showed "Good(-72)" while the register read -72 — the
+    /// unit is dBm and the sign is as sent.
+    pub fn wifi_signal() -> Self {
+        Self {
+            key: "wifi_signal",
+            name: "Wi-Fi signal".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("signal_strength"),
+            unit: Some("dBm"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// How often the device says it reports, in seconds.
+    ///
+    /// Config register 4. It qualifies [`Self::last_update`]: how stale a reading is only means something
+    /// against how often one is expected. Every frame ever captured says 5.
+    pub fn data_interval() -> Self {
+        Self {
+            key: "data_interval",
+            name: "Telemetry interval".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: Some("s"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(None),
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// Restart the datalogger.
+    ///
+    /// Config register 32, the one action worth offering: the device reboots, reconnects by itself within
+    /// seconds, and the inverter keeps running throughout — so the cost of an accidental press is a gap in
+    /// telemetry. Its sibling, the factory reset of register 35, is deliberately **not** published: it
+    /// clears the Wi-Fi credentials, and recovering from that means standing next to the device with a
+    /// Bluetooth client.
+    ///
+    /// A button carries no state, so unlike the other config entities this names a register the device
+    /// never reports — there is nothing to report. Home Assistant is told not to enable it by default;
+    /// rebooting hardware should be a deliberate act.
+    pub fn restart() -> Self {
+        Self {
+            key: "restart",
+            name: "Restart datalogger".to_owned(),
+            component: Component::Button,
+            device_class: Some("restart"),
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// The meter reading to supply to the device.
+    ///
+    /// Optimistic, because the device offers no read-back for these registers. The feedback is the
+    /// `meter_active_power` sensor — the device's own report of the reading it currently holds, which
+    /// falls to zero by itself when a reading expires. So Home Assistant shows what it asked for, and the
+    /// sensor beside it shows what the device is acting on; the two disagreeing is exactly the signal that
+    /// something has stopped writing.
+    ///
+    /// **This is not a setting, and writing it once achieves nothing lasting.** A reading expires after
+    /// about two minutes, so whatever drives this has to write it again inside that window, from a figure
+    /// it has actually measured. Nothing in this program refreshes it.
+    ///
+    /// Bounds are wider than the equipment can do anything with, deliberately: the reading describes the
+    /// *house*, not the device, and a household can import far more than a 2 kW inverter can offset.
+    pub fn meter_reading() -> Self {
+        Self {
+            key: METER_READING,
+            name: "Supplied meter reading".to_owned(),
+            component: Component::Number,
+            device_class: Some("power"),
+            unit: Some("W"),
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Numeric(Bounds {
+                min: -20_000,
+                max: 20_000,
+            }),
+            source: None,
+            presence: Presence::Device,
+            enabled: true,
+            // Deliberately ungated. Writing a reading is what *makes* the device hold one, so gating this
+            // on the device already holding one would leave the only way in permanently unavailable.
+            // Whether a reading is in effect is reported by `meter_connected` beside it.
+            gate: None,
+        }
+    }
+
+    /// Withdraw the supplied reading, telling the device its meter has gone.
+    ///
+    /// A button rather than the off half of a switch: there is no meaningful "on" to pair it with, since
+    /// arming without a figure would supply nothing. It writes the all-zero block the firmware itself
+    /// writes for a meter that stopped answering, which drops the reading at once instead of waiting out
+    /// the two-minute expiry.
+    ///
+    /// Distinct from supplying `0`, which is a *valid* reading meaning the grid is balanced — and which
+    /// the device acts on by holding its output where it is.
+    pub fn withdraw_meter_reading() -> Self {
+        Self {
+            key: WITHDRAW_METER_READING,
+            name: "Withdraw meter reading".to_owned(),
+            component: Component::Button,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: None,
+            presence: Presence::Device,
+            enabled: true,
+            // Nothing to withdraw when the device holds no reading.
+            gate: Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED,
+            }),
+        }
+    }
+
+    /// Open a pairing window on the device's LoRa radio, so it adopts an accessory that asks to be adopted.
+    ///
+    /// A button, and it could not be anything else: the command carries no accessory type and no serial,
+    /// so there is nothing to choose. Which accessory is adopted is decided by whichever one is in its own
+    /// pairing state, because somebody pressed a button on it — which also means this is only useful to
+    /// somebody standing next to the hardware.
+    ///
+    /// Ungated. The window closes itself and the register clears itself, so there is nothing that says
+    /// whether pressing it would achieve anything.
+    ///
+    /// **No companion sensor, on purpose.** The window does have observable state — the register reads `1`
+    /// for the 60 s it is open — but only to a reader that asks: no telemetry field carries it. Publishing
+    /// it would mean a poll loop running whenever a window might be open, to report something whose whole
+    /// lifetime is a minute and which the person who just pressed the button already knows.
+    ///
+    /// Deliberately *not* named for accessories in general. A network accessory is searched for by service
+    /// name and identified over HTTP afterwards; that needs arguments and produces a list, so it would be
+    /// its own control rather than a second meaning for this one.
+    pub fn pair_lora_accessory() -> Self {
+        Self {
+            key: PAIR_LORA_ACCESSORY,
+            name: "Pair a LoRa accessory".to_owned(),
+            component: Component::Button,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: None,
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// The product's full firmware version, one field per component.
+    ///
+    /// Assembled rather than reported: four fields come from two telemetry registers, the CT field is a
+    /// constant, and the datalogger's own version comes from the config space. The vendor's application
+    /// shows this string and its update service keys downloads on it, so it is the version an owner will
+    /// be asked for — where the datalogger version alone answers a different question.
+    ///
+    /// Its own topic, because it needs a telemetry frame to exist at all.
+    pub fn firmware_version() -> Self {
+        Self {
+            key: FIRMWARE_VERSION,
+            name: "Firmware version".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Status),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// The serial the device identifies itself by.
+    ///
+    /// Already the device page's `serial_number`, and repeated as an entity because that field cannot be
+    /// templated against while an entity can. Config register 8, which is also the MQTT client identifier.
+    pub fn serial_number() -> Self {
+        Self {
+            key: "serial_number",
+            name: "Serial number".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// How far apart the highest and lowest cell are, in millivolts.
+    ///
+    /// Computed here because the device reports the two extremes and never the difference, and the
+    /// difference is what carries the information: a percentage cannot say whether a pack is balanced, and
+    /// a pack that diverges at the top of charge terminates early — which is what makes the BMS's own
+    /// health estimate read low. Diagnostic rather than a reading: it says something about the hardware's
+    /// condition, not about the energy flowing.
+    pub fn cell_spread() -> Self {
+        Self {
+            key: CELL_SPREAD,
+            name: "Battery cell spread".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("voltage"),
+            unit: Some("mV"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// The lowest cell's voltage the last time the pack was resting.
+    ///
+    /// Not the live reading, which says as much about internal resistance as about charge: this is
+    /// sampled only after the battery has been neither charging nor discharging long enough for the cells
+    /// to settle. It is the one independent read on state of charge, since everything else about it is a
+    /// coulomb count, and a coulomb count drifts.
+    ///
+    /// Unavailable until the pack has rested that long, which is honest: there is no such measurement
+    /// before then, and a live value in its place would invite exactly the comparison it cannot support.
+    pub fn resting_voltage() -> Self {
+        Self {
+            key: RESTING_VOLTAGE,
+            name: "Battery resting cell voltage".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("voltage"),
+            unit: Some("mV"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// Whether the reported state of charge agrees with that resting voltage.
+    ///
+    /// A problem sensor rather than a reading, because the useful state is the disagreement: a pack
+    /// resting in the middle of its plateau while reporting single digits has a counter that has drifted,
+    /// and the correction — a snap to full at the next charge — rewrites the pack's health estimate from
+    /// the wrong span. Catching it while it accumulates is the difference between a diagnostic and an
+    /// autopsy.
+    ///
+    /// It reports nothing across most of the range, since lithium iron phosphate rests at almost the same
+    /// voltage from a fifth full to four fifths. The chemistry only speaks at the knees, so that is where
+    /// this speaks.
+    pub fn soc_credible() -> Self {
+        Self {
+            key: SOC_CREDIBLE,
+            name: "State of charge disagrees with cell voltage".to_owned(),
+            component: Component::BinarySensor,
+            device_class: Some("problem"),
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Signal { on: "1", off: "0" },
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// What accessories the device has been told about, over the network and over its LoRa radio.
+    ///
+    /// Config registers 122 and 102, both carried in the identity report the device sends on every
+    /// connect. Diagnostics rather than readings: an accessory is something an installation either has or
+    /// has not, and the answer changes only when somebody registers one.
+    ///
+    /// **The value is the device's own line, not an interpretation of it.** `DEV:` alone means nothing is
+    /// registered; an entry reads `<index>-<mode>-<state>,<name>,<address>`, and a **state of 5 is a
+    /// deleted entry** — the device tombstones rather than removing, and the entry survives in the list
+    /// until the datalogger restarts. Showing the line as sent is what lets a reader tell an accessory
+    /// that is registered from one that was removed; a tidied version could not.
+    pub fn accessory_list(key: &'static str, name: &str) -> Self {
+        Self {
+            key,
+            name: name.to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
+    /// The same entity with nothing writable about it.
+    ///
+    /// What `HELIOBRIDGE_ALLOW_WRITES=false` produces: a setting still worth seeing, published as a plain
+    /// reading so Home Assistant offers no control that would be refused. A read-only `number` would still
+    /// draw a spinbox.
+    ///
+    /// **Diagnostic, not config.** Home Assistant reserves `config` for entities that change something and
+    /// refuses to add a sensor carrying it — every read-only setting was rejected that way, and sat
+    /// unavailable, until this said otherwise. `diagnostic` is its category for configuration that can be
+    /// seen but not changed, which is exactly this.
+    #[must_use]
+    pub fn into_read_only(self) -> Self {
+        if !self.is_writable() {
+            return self;
+        }
+        let (component, shape, device_class, unit) = match self.shape {
+            // A switch reads 0 or 1, which as a sensor is a bare digit; as a binary sensor it is on or off.
+            Shape::Toggle => (Component::BinarySensor, Shape::Signal { on: "1", off: "0" }, None, None),
+            // The state is already the label, so the set is all Home Assistant needs. An `enum` sensor may
+            // not carry a unit.
+            Shape::Choice(labels) => (Component::Sensor, Shape::Labelled(labels), Some("enum"), None),
+            // Nothing here accumulates: these are positions and limits, not counters.
+            _ => (Component::Sensor, Shape::Reading(None), self.device_class, self.unit),
+        };
+        Self {
+            component,
+            shape,
+            device_class,
+            unit,
+            category: Some(Category::Diagnostic),
+            ..self
+        }
+    }
+
+    /// The battery pack this entity describes, if it describes one.
+    ///
+    /// Packs are numbered from 1, and the device reports how many are attached. A pack that is not
+    /// attached still occupies its registers, and they read zero — which becomes 0 % for a state of charge
+    /// and **−273.1 °C** for a temperature, since zero kelvin is what the temperature scaling makes of a
+    /// zero raw value. Publishing absolute zero as a reading is worse than publishing nothing.
+    pub fn battery_pack(&self) -> Option<u16> {
+        let rest = self.key.strip_prefix("battery")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// Whether this entity is published on a topic of its own rather than reading a shared object.
+    ///
+    /// **Home Assistant does not silently ignore a state that templates to nothing.** A `text` entity
+    /// fails the length and pattern it was announced with, and a `sensor` logs `Invalid state message ''`
+    /// — both observed. So a field that is sometimes *absent* from its object must not share that object
+    /// with fields that are always present: on a topic of its own, nothing is published until there is
+    /// something to publish, and the entity simply stays unknown.
+    ///
+    /// Two fields are absent for a while:
+    ///
+    /// - a slot boundary, because the settings cache fills in one register at a time over the half-minute
+    ///   a resync takes;
+    /// - [`LAST_UPDATE`], which does not exist until a frame has arrived.
+    pub fn published_alone(&self) -> bool {
+        matches!(self.shape, Shape::TimeOfDay | Shape::Weekdays)
+            || self.key == LAST_UPDATE
+            || self.key == FIRMWARE_VERSION
+    }
+
+    /// Whether this entity accepts commands.
+    pub const fn is_writable(&self) -> bool {
+        matches!(
+            self.shape,
+            Shape::Numeric(_) | Shape::Toggle | Shape::Choice(_) | Shape::TimeOfDay | Shape::Weekdays | Shape::Action
+        )
+    }
+}
+
+/// How many battery packs the register map describes.
+///
+/// The device reports how many are attached; this is the ceiling the registers provide for, so it is also
+/// how far a reconciliation has to look for entities left over from a larger installation.
+pub const BATTERY_PACKS: u16 = 4;
+
+/// Which entities one device gets.
+///
+/// The three things that vary between installations, in one place: how much of the schedule is exposed,
+/// whether this bridge is allowed to write, and how much battery is attached. All three are known only at
+/// runtime, so the catalogue is built per device rather than being a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Catalogue {
+    /// How many schedule slots get entities, 1–9. Each adds five.
+    pub slots: u16,
+    /// Which settings may be written, and so which are offered as controls.
+    ///
+    /// The same value the command topic is checked against, so a control is published exactly when a
+    /// command for it would be honoured. A setting that may not be written still appears — as a plain
+    /// reading, since whether it is on remains worth seeing even where this bridge may not change it.
+    pub permitted: Permitted,
+    /// How many battery packs get entities.
+    ///
+    /// What the device reports, and **one** until it has: it is a battery, so it has at least that. There
+    /// is deliberately no "unknown" here — it would produce a second catalogue identical to this one, and a
+    /// second announcement of it.
+    pub packs: u16,
+}
+
+impl Default for Catalogue {
+    fn default() -> Self {
+        Self {
+            slots: 1,
+            permitted: Permitted::default(),
+            packs: 1,
+        }
+    }
+}
+
+impl Catalogue {
+    /// Every entity this device should have, in a stable order.
+    ///
+    /// The settings are exactly the resync set — the same registers the session reads back on connect — so
+    /// every published setting entity has a value behind it rather than sitting unavailable forever.
+    pub fn entities<D: Registers>(self, driver: &D) -> Vec<Entity> {
+        let measurements = driver.measurements();
+        let reported: HashSet<&'static str> = measurements.iter().map(Measurement::name).collect();
+
+        let settings: Vec<Entity> = driver
+            .settings(self.slots)
+            .into_iter()
+            .map(|register| {
+                let mut entity = Entity::for_setting(&register);
+                // The charge limits are the two fields that exist in both address spaces: a writable
+                // holding register, and an input register carried in every telemetry frame. One entity,
+                // then — a duplicate key is an entity Home Assistant drops without saying so — and it
+                // reads from telemetry, which is fresher by up to an hour: the settings cache learns of a
+                // change made in the vendor app from the hourly snapshot, and from nothing sooner.
+                if reported.contains(register.name()) {
+                    entity.source = Some(Source::Telemetry);
+                }
+                if self.permitted.allows(register.name()) {
+                    entity
+                } else {
+                    entity.into_read_only()
+                }
+            })
+            .collect();
+
+        let claimed: HashSet<&'static str> = settings.iter().map(|entity| entity.key).collect();
+        let readings = measurements
+            .iter()
+            .filter_map(Entity::for_reading)
+            .filter(|entity| self.includes(entity))
+            .filter(|entity| !claimed.contains(entity.key));
+
+        readings
+            .chain(settings)
+            .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
+            .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
+            .chain([Entity::firmware_version()])
+            .chain([
+                Entity::accessory_list("accessory_list", "Accessories on the network"),
+                Entity::accessory_list("accessory_list_rf", "Accessories on the LoRa radio"),
+            ])
+            .chain([Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()])
+            // An action has nothing to publish but a control, so refusing writes withdraws it entirely
+            // rather than downgrading it to a reading the way a setting does. The meter controls go the
+            // same way: both are write-only, so read-only versions of them would be entities that can
+            // neither be read nor written.
+            .chain(self.permitted.writes.then(Entity::restart))
+            .chain(self.permitted.writes.then(Entity::meter_reading))
+            .chain(self.permitted.writes.then(Entity::withdraw_meter_reading))
+            .chain(self.permitted.writes.then(Entity::pair_lora_accessory))
+            .collect()
+    }
+
+    /// Entities this program once published and no longer does.
+    ///
+    /// [`Self::everything`] is built from the register maps, so by construction it cannot describe an
+    /// entity whose constructor has been **deleted**. That makes a removal invisible to the very
+    /// reconciliation meant to clean up after one: the retained discovery message stays on the broker,
+    /// Home Assistant keeps the entity forever, and it survives restarts because the retained message
+    /// re-creates it. Nothing in the code would ever mention it again, so nothing would ever notice.
+    ///
+    /// This is the memory the catalogue otherwise lacks. An entry is a `(component, key)` pair, because the
+    /// component picks the discovery topic — the same reason `everything` includes both forms of a setting.
+    ///
+    /// **Add to this list in the same change that deletes an entity**, and leave the entry in place. It
+    /// costs one empty retained publish per session on a topic that is already empty; the alternative is a
+    /// stale entity on someone's dashboard that only a hand-run `mosquitto_pub` can remove.
+    ///
+    /// An entity that existed only between two commits needs no entry — nobody's broker ever held it. The
+    /// list is for entities that reached a release.
+    pub const RETIRED: &'static [(Component, &'static str)] = &[
+        // Input registers 119 and 120 were published as two raw integers while their meaning was unknown.
+        // They hold four component versions, one per octet, and are published as the assembled
+        // `firmware_version` instead — a dashboard reading of `3596` meant nothing to anyone.
+        (Component::Sensor, "sw_version_part_1"),
+        (Component::Sensor, "sw_version_part_2"),
+    ];
+
+    /// Every `(component, key)` a reconciliation has to retract if it finds it, on top of what
+    /// [`Self::everything`] can describe: [`Self::RETIRED`], and the form a read-only switch took up to
+    /// 0.8.x.
+    ///
+    /// That form was a `sensor`, and is a `binary_sensor` now, so its retained discovery message sits on a
+    /// topic nothing produces any more. Home Assistant never added those sensors — they carried
+    /// `entity_category: config`, which it refuses on a sensor — but it re-reads the retained message and
+    /// logs the refusal on every start until something empties it. Derived from the register map rather
+    /// than listed, because every schedule slot has a switch of its own.
+    pub fn retired<D: Registers>(driver: &D) -> Vec<(Component, &'static str)> {
+        let switches = driver
+            .settings(driver.slots())
+            .into_iter()
+            .filter(|setting| setting.shape() == Control::Switch)
+            .map(|setting| (Component::Sensor, setting.name()));
+        Self::RETIRED.iter().copied().chain(switches).collect()
+    }
+
+    /// Every entity any configuration of this device could produce.
+    ///
+    /// What a reconciliation has to compare against when there is no record of what was announced before —
+    /// after a restart, where the broker may still hold retained discovery from a run configured
+    /// differently. Both forms of every setting are included: refusing writes changes an entity's
+    /// *component*, and therefore its discovery topic, so a `switch` that became a `binary_sensor` leaves a
+    /// retained message behind under its old name.
+    pub fn everything<D: Registers>(driver: &D) -> Vec<Entity> {
+        let widest = Self {
+            slots: driver.slots(),
+            permitted: Permitted::default(),
+            packs: BATTERY_PACKS,
+        };
+        // Two passes cover every component a setting can be published as: with writes refused, each control
+        // becomes a reading, and that includes the one setting whose reachability is configurable on its own.
+        let mut all = widest.entities(driver);
+        all.extend(
+            Self {
+                permitted: Permitted {
+                    writes: false,
+                    ..widest.permitted
+                },
+                ..widest
+            }
+            .entities(driver),
+        );
+        all
+    }
+
+    /// Whether a reading belongs in this catalogue at all.
+    ///
+    /// Only per-pack readings are ever left out, and only for a pack that is not attached: its registers
+    /// read zero, which the temperature scaling turns into −273.1 °C, and publishing absolute zero as a
+    /// reading is worse than publishing nothing.
+    fn includes(self, entity: &Entity) -> bool {
+        match entity.battery_pack() {
+            Some(pack) => pack <= self.packs,
+            None => true,
+        }
+    }
+}
+
+/// The Home Assistant device class for a reading.
+///
+/// From the unit, with the name deciding the cases a unit cannot: watts are power and watt-hours are
+/// energy, but a percentage is a state of charge on one register and a limit on another.
+fn device_class(name: &str, unit: Unit) -> Option<&'static str> {
+    match unit {
+        Unit::Watt => Some("power"),
+        Unit::KilowattHour => Some("energy"),
+        Unit::Volt => Some("voltage"),
+        Unit::Ampere => Some("current"),
+        Unit::Celsius => Some("temperature"),
+        Unit::Second => Some("duration"),
+        // `battery` means state of charge specifically. A percentage that is a limit or a signal quality
+        // is left without a class rather than mislabelled.
+        Unit::Percent if name.contains("soc") || name.contains("soh") => Some("battery"),
+        Unit::Percent | Unit::None => None,
+    }
+}
+
+/// How a reading behaves over time.
+///
+/// Energy accumulates; everything else is instantaneous. Nothing else may be `total_increasing`: the
+/// recorder treats a fall as a counter reset and counts the whole next value as new.
+fn state_class(device_class: Option<&'static str>) -> StateClass {
+    if device_class == Some("energy") {
+        StateClass::TotalIncreasing
+    } else {
+        StateClass::Measurement
+    }
+}
+
+/// Whether a field is a word of flags rather than a measurement.
+///
+/// By name, as the diagnostics rule is. The register map calls these `*_faults` and the specification
+/// documents them as flags words with a bit table each; nothing else in either map is a bitfield.
+fn is_flags(name: &str) -> bool {
+    // The heater state too: a word with one bit per pack, which reads at a glance in hexadecimal.
+    name.ends_with("_faults") || name == HEATER_STATE
+}
+
+/// Whether a reading is a 0/1 condition rather than a quantity, and the device class that says which.
+///
+/// Named rather than derived, for the same reason as [`is_flags`]: the register map says a value is a
+/// 16-bit integer, and only this knows that it is really a yes or no. A binary sensor rather than a sensor
+/// reading `0`, so an automation can ask `is_state(..., 'on')`.
+///
+/// The class carries as much as the shape does, because Home Assistant writes the state in its words:
+/// `connectivity` reads *Connected*, which is what a meter either is, and `running` reads *Running*,
+/// which is what a mode the device has entered either is. Neither sentence fits the other reading.
+fn signal_class(name: &str) -> Option<&'static str> {
+    match name {
+        METER_CONNECTED => Some("connectivity"),
+        OFF_GRID_ACTIVE => Some("running"),
+        _ => None,
+    }
+}
+
+/// How many decimals a reading resolves, from the scaling that produced it.
+///
+/// The register map is the authority on this: a value scaled by a thousandth resolves to a thousandth, and
+/// claiming more decimals than that would render noise as precision. Without it Home Assistant picks a
+/// default from the unit, and its default for volts is none — which shows a cell voltage of 3.325 V as
+/// `3 V`.
+fn precision(scaling: Scaling) -> u8 {
+    // Compared as ranges rather than for equality: these are the multipliers the map uses, and a float is
+    // the wrong thing to test for exactness.
+    if scaling.multiplier >= 1.0 {
+        0
+    } else if scaling.multiplier >= 0.1 {
+        1
+    } else if scaling.multiplier >= 0.01 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Whether a reading belongs in the diagnostics block rather than on the dashboard.
+///
+/// What is left there is what describes the *equipment* rather than the energy: which firmware it runs,
+/// how well it is reaching the network, what is wrong with it, and the cell-level detail behind the pack.
+///
+/// Confidence deliberately does not decide this. It once did — anything short of verified was filed as a
+/// diagnostic — and the effect was that most of the device ended up in a collapsed block: the state of
+/// charge of every pack but the first, every PV string's voltage and current, the daily AC output, the grid
+/// voltage, the cycle count. Those are the readings someone builds a dashboard out of. How firmly a
+/// field's meaning is established is still published, on every reading the control API serves and as a
+/// marker in the specification, which is where a reader can act on it.
+fn diagnostic(name: &str) -> Option<Category> {
+    let equipment = name.contains("version")
+        || name.contains("signal")
+        || name.contains("serial")
+        // Per-cell voltages describe the pack's internals. Useful when investigating one, noise beside a
+        // reading of what the house is doing.
+        || name.contains("cell")
+        || name.contains("fault")
+        // The vendor's smart plugs, on the same footing as the other accessories: something an
+        // installation either has or has not, and zero throughout for one that has not.
+        || name.starts_with("smart_plug")
+        // A readback of a setting Home Assistant already offers as a switch. It earns a place for the
+        // moment the two disagree, not a place on the dashboard beside the switch itself.
+        || name == OFF_GRID_ACTIVE
+        || name == HEATER_STATE;
+    equipment.then_some(Category::Diagnostic)
+}
+
+/// The unit symbol, or `None` where there is none.
+fn symbol(unit: Unit) -> Option<&'static str> {
+    match unit {
+        Unit::None => None,
+        unit => Some(unit.symbol()),
+    }
+}
+
+/// A field name as a person would write it.
+///
+/// `charge_limit_upper` becomes `Charge limit upper`. Names that would understate what a setting does are
+/// spelled out instead, because the device page is where someone decides whether to touch it — and one of
+/// these disconnects the inverter from the grid.
+fn label(name: &str) -> String {
+    if let Some(spelled) = NAMED.iter().find(|(field, _)| *field == name) {
+        return spelled.1.to_owned();
+    }
+
+    let mut out = String::with_capacity(name.len());
+    for (index, word) in name.split('_').enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&word_label(word, index == 0));
+    }
+    out
+}
+
+/// One word of a field name, as a person would write it.
+fn word_label(word: &str, first: bool) -> String {
+    let letters: String = word.chars().take_while(char::is_ascii_alphabetic).collect();
+    let digits = word.get(letters.len()..).unwrap_or_default();
+
+    // An abbreviation nobody says out loud is spelled out. `battery1_soc` on a device page should read
+    // like the thing it is, not like a field name — and the numbered ones are the diagnostics, where a
+    // reader has the least context to expand it themselves.
+    if let Some(spelled) = SPELLED.iter().find(|(short, _)| *short == letters) {
+        return format!("{}{digits}", spelled.1);
+    }
+
+    // An acronym stays an acronym wherever it appears, including where a digit is stuck to it: `pv1`
+    // reads as `PV1`, not `Pv1`.
+    if ACRONYMS.contains(&letters.as_str()) {
+        return format!("{}{digits}", letters.to_uppercase());
+    }
+
+    // A word with a number stuck to it is two things: `battery1` is battery 1, and reads that way.
+    let spaced = if digits.is_empty() {
+        letters
+    } else {
+        format!("{letters} {digits}")
+    };
+    let mut characters = spaced.chars();
+    match characters.next() {
+        Some(initial) if first => {
+            let mut out: String = initial.to_uppercase().collect();
+            out.push_str(characters.as_str());
+            out
+        }
+        _ => spaced,
+    }
+}
+
+/// Words that are acronyms rather than words, whatever their position.
+const ACRONYMS: &[&str] = &["ac", "dc", "pv", "usb", "id", "ip"];
+
+/// Abbreviations that read as jargon and are spelled out instead.
+///
+/// Not in [`ACRONYMS`]: these are written short in the protocol and said long by people, so an entity name
+/// carrying the short form asks the reader to know the field name.
+const SPELLED: &[(&str, &str)] = &[("soc", "state of charge"), ("soh", "state of health")];
+
+/// Settings published switched off, because nothing is known to depend on them.
+///
+/// Not a judgement that the device ignores them, which is rarely provable — only that this project has
+/// measured no effect. Anyone who wants one enables it in Home Assistant.
+const DISABLED: &[&str] = &["ac_couple_enabled"];
+
+/// Fields whose name would read badly or understate what they do.
+///
+/// Two of these matter beyond tidiness: the device page is where someone decides whether to touch a
+/// switch, and one of them disconnects the inverter from the grid.
+const NAMED: &[(&str, &str)] = &[
+    ("off_grid_mode", "Off-grid mode (stops AC output)"),
+    ("power_plus", "Power+ (raises the output ceiling)"),
+    ("anti_backflow_enabled", "Export limitation"),
+    ("anti_backflow_power_percent", "Export limit"),
+    ("grid_power_allowed", "Grid charging allowed"),
+    ("ac_couple_enabled", "AC couple enable"),
+    ("always_on", "Always on"),
+    ("battery_soc_total", "Battery state of charge"),
+    ("battery_soh", "Battery health"),
+    ("battery_charge_status", "Battery status"),
+    ("battery_charge_power", "Battery power"),
+    ("battery_charge_energy_today", "Battery charged today"),
+    ("battery_discharge_energy_today", "Battery discharged today"),
+    ("ac_output_energy_today", "AC output today"),
+    ("energy_today", "Energy today"),
+    ("pv_power_total", "Solar power"),
+    ("household_load_total", "Household load"),
+    ("household_load_excl_groplug", "Household load, excluding plugs"),
+    ("charge_limit_upper", "Charge limit, upper"),
+    ("charge_limit_lower", "Charge limit, lower"),
+    // Every power that is an *output* says so, so that the three of them read as one family beside the
+    // slot and default settings that command them. The field names are left alone: they are the
+    // specification's, and appear in the state topic and in every capture.
+    ("ac_power", "AC output power"),
+    ("on_grid_power", "On-grid output power"),
+    ("off_grid_power", "Off-grid output power"),
+    ("default_output_power", "Default output power"),
+    // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
+    ("internal_faults", "Internal fault flags"),
+    ("battery_faults", "Battery fault flags"),
+    ("grid_faults", "Grid fault flags"),
+    ("output_faults", "Output fault flags"),
+    ("device_temp", "Device temperature"),
+    ("battery1_temp", "Battery temperature"),
+    ("inverter_temp", "Inverter temperature"),
+    ("wifi_signal", "Wi-Fi signal"),
+    ("off_grid_mode_active", "Off-grid mode active"),
+    ("battery_heater_state", "Battery heater state"),
+    ("smart_plug_power", "Smart plug load"),
+    ("smart_plug_connected", "Smart plugs connected"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source,
+        StateClass, VERSION_PARTS,
+    };
+    use crate::growatt::driver::Growatt;
+    use crate::growatt::v7::registers::{
+        Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
+    };
+    use crate::model::Register;
+
+    /// Nothing is announced that the device does not volunteer.
+    ///
+    /// A config register that only answers an explicit read would give Home Assistant an entity it can
+    /// never fill in by itself: it would sit unknown from the moment it appeared until somebody happened
+    /// to ask for that register. Most of the config space is like that, so the rule needs holding
+    /// structurally rather than remembering.
+    #[test]
+    fn every_config_entity_reads_a_register_the_device_reports() {
+        // Actions are excluded because they carry no state at all: a button has no state topic, so there
+        // is nothing for the device to report and no register to require in the identity report.
+        let published: Vec<_> = Catalogue::everything(&Growatt)
+            .into_iter()
+            .filter(|entity| entity.source == Some(Source::Config) && entity.shape != Shape::Action)
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "the config entities went missing rather than passing trivially"
+        );
+
+        for entity in published {
+            let register = ConfigRegister::lookup_name(entity.key)
+                .unwrap_or_else(|| panic!("{} is published but names no config register", entity.key));
+            assert_eq!(
+                register.availability,
+                Availability::Reported,
+                "{} is published but the device only answers it on request",
+                entity.key
+            );
+        }
+    }
+
+    /// A setting by name, from the listed registers or from the generated slot ones.
+    fn setting(name: &str) -> Entity {
+        if let Some(register) = HOLDING_REGISTERS.iter().find(|entry| entry.name == name) {
+            return Entity::for_setting(register);
+        }
+        for slot in 1..=9u16 {
+            for register in HoldingRegister::slot(slot).expect("a slot in range") {
+                if register.name == name {
+                    return Entity::for_setting(&register);
+                }
+            }
+        }
+        panic!("no setting {name}")
+    }
+
+    fn reading(name: &str) -> Entity {
+        let register = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("no reading {name}"));
+        Entity::for_reading(register).expect("published")
+    }
+
+    #[test]
+    fn a_ranged_setting_becomes_a_number_carrying_the_registers_own_bounds() {
+        // The bounds are the encoder's, not a second copy: an entity cannot offer a value the device
+        // would refuse, because both come from the register map.
+        let entity = setting("charge_limit_upper");
+        assert_eq!(entity.component, Component::Number);
+        assert_eq!(entity.category, Some(Category::Config));
+        assert_eq!(entity.unit, Some("%"));
+        match entity.shape {
+            Shape::Numeric(bounds) => {
+                assert_eq!((bounds.min, bounds.max), (70, 100));
+            }
+            other => panic!("expected a numeric shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_domain_picks_its_own_component() {
+        assert_eq!(setting("always_on").component, Component::Switch);
+        assert_eq!(setting("slot1_work_mode").component, Component::Select);
+        assert_eq!(setting("slot1_start_time").component, Component::Text);
+        assert_eq!(setting("slot1_output_power").component, Component::Number);
+    }
+
+    #[test]
+    fn a_work_mode_offers_the_labels_the_device_uses() {
+        match setting("slot1_work_mode").shape {
+            Shape::Choice(labels) => assert!(labels.len() >= 3, "{labels:?}"),
+            other => panic!("expected a choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_energy_accumulates() {
+        // A `total_increasing` reading that is not a counter would make the Energy dashboard read a fall
+        // as a reset and count the next value as fresh energy.
+        assert_eq!(
+            reading("pv_energy_today").shape,
+            Shape::Reading(Some(StateClass::TotalIncreasing))
+        );
+        assert_eq!(reading("ac_power").shape, Shape::Reading(Some(StateClass::Measurement)));
+        assert_eq!(
+            reading("battery_soc_total").shape,
+            Shape::Reading(Some(StateClass::Measurement))
+        );
+    }
+
+    #[test]
+    fn device_classes_follow_the_unit_except_where_it_cannot() {
+        assert_eq!(reading("ac_power").device_class, Some("power"));
+        assert_eq!(reading("pv_energy_today").device_class, Some("energy"));
+        assert_eq!(reading("battery1_temp").device_class, Some("temperature"));
+        // A percentage that is a charge level, against one that is not.
+        assert_eq!(reading("battery_soc_total").device_class, Some("battery"));
+        assert_eq!(setting("anti_backflow_power_percent").device_class, None);
+    }
+
+    #[test]
+    fn per_pack_entities_name_the_pack_they_describe() {
+        // What lets an absent pack be left unpublished: its registers read zero, which the temperature
+        // scaling turns into absolute zero.
+        assert_eq!(reading("battery1_soc").battery_pack(), Some(1));
+        assert_eq!(reading("battery2_temp").battery_pack(), Some(2));
+        assert_eq!(reading("battery4_soc").battery_pack(), Some(4));
+
+        // Battery-wide readings belong to no single pack and are always published.
+        for key in ["battery_soc_total", "battery_charge_power", "battery_cycles"] {
+            assert_eq!(reading(key).battery_pack(), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_absent_pack_would_report_absolute_zero() {
+        // The reason the pack count is consulted at all, pinned so nobody removes the check as redundant.
+        let entry = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == "battery2_temp")
+            .expect("battery2_temp");
+        let absent = entry.decode(crate::model::Raw(0));
+        match absent {
+            crate::model::Value::Float(celsius) => {
+                assert!(celsius < -273.0, "an unattached pack decodes to {celsius} °C");
+            }
+            other => panic!("expected a temperature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fault_words_are_diagnostics_and_never_look_like_measurements() {
+        // Bitfields, most of whose bits nobody has seen set: worth exposing so a fault is visible at all,
+        // but not on the dashboard, and with nothing about them that suggests a quantity. `Grid faults: 0`
+        // reads as a count of faults, and `1024` is not more of anything than `512`.
+        for key in ["internal_faults", "grid_faults", "output_faults", "battery_faults"] {
+            let entity = reading(key);
+            assert_eq!(entity.category, Some(Category::Diagnostic), "{key}");
+            assert_eq!(entity.unit, None, "{key}");
+            assert_eq!(entity.device_class, None, "{key}");
+            assert_eq!(entity.precision, None, "{key}");
+            assert_eq!(entity.shape, Shape::Flags, "{key}");
+        }
+        assert_eq!(reading("grid_faults").name, "Grid fault flags");
+    }
+
+    #[test]
+    fn a_field_in_both_address_spaces_becomes_one_entity_fed_by_telemetry() {
+        // The charge limits are a writable holding register *and* an input register in every frame. Two
+        // entities would share a unique_id, which Home Assistant resolves by dropping one without saying
+        // so — and the telemetry copy is the fresher source, since the settings cache learns of a change
+        // made elsewhere only when the next hourly snapshot arrives.
+        let entities = Catalogue::default().entities(&Growatt);
+        for key in ["charge_limit_upper", "charge_limit_lower"] {
+            let matching: Vec<&Entity> = entities.iter().filter(|entity| entity.key == key).collect();
+            assert_eq!(matching.len(), 1, "{key} appears {} times", matching.len());
+            let entity = matching.first().expect("just counted");
+            assert_eq!(entity.component, Component::Number, "{key} must stay writable");
+            assert_eq!(
+                entity.source,
+                Some(Source::Telemetry),
+                "{key} should read the fresher source"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_entities_claim_one_key() {
+        // A duplicate is a silently missing entity, so the whole catalogue is checked rather than the two
+        // fields known to overlap today.
+        for slots in [1, 9] {
+            let entities = Catalogue {
+                slots,
+                ..Catalogue::default()
+            }
+            .entities(&Growatt);
+            let mut keys: Vec<&str> = entities.iter().map(|entity| entity.key).collect();
+            let total = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), total, "the catalogue repeats a key with {slots} slots");
+        }
+    }
+
+    #[test]
+    fn a_settings_entity_reads_the_settings_topic_unless_telemetry_carries_it() {
+        let entities = Catalogue::default().entities(&Growatt);
+        let source = |key: &str| {
+            entities
+                .iter()
+                .find(|entity| entity.key == key)
+                .map(|entity| entity.source)
+        };
+        assert_eq!(source("always_on"), Some(Some(Source::Settings)));
+        assert_eq!(source("slot1_output_power"), Some(Some(Source::Settings)));
+        assert_eq!(source("ac_power"), Some(Some(Source::Telemetry)));
+        assert_eq!(source("connected"), Some(Some(Source::Status)));
+    }
+
+    #[test]
+    fn a_label_is_a_sensor_with_nothing_to_measure() {
+        // Home Assistant refuses a state class on a non-numeric state, and there is nothing to average or
+        // accumulate in a work mode anyway.
+        let mode = reading("work_mode");
+        assert_eq!(mode.shape, Shape::Reading(None));
+        assert_eq!(mode.device_class, Some("enum"));
+        assert_eq!(mode.unit, None);
+    }
+
+    #[test]
+    fn every_measured_reading_carries_a_state_class_and_nothing_else_does() {
+        // A state class on something that is not a quantity is what the recorder trips over: it will happily
+        // average a work mode's index or read a bitfield falling to zero as a counter reset.
+        for register in INPUT_REGISTERS {
+            let Some(entity) = Entity::for_reading(register) else {
+                continue;
+            };
+            // A bitfield and a yes-or-no are both 16-bit integers in the map and neither is a quantity.
+            let quantity = matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32)
+                && !matches!(entity.shape, Shape::Flags | Shape::Signal { .. });
+            match entity.shape {
+                Shape::Reading(state_class) => assert_eq!(
+                    state_class.is_some(),
+                    quantity,
+                    "{} has the wrong state class for its kind",
+                    entity.key
+                ),
+                Shape::Flags => assert!(!quantity, "{} is a bitfield, not a quantity", entity.key),
+                // A yes-or-no is not a quantity either: no unit, no state class, nothing to average.
+                Shape::Signal { .. } => {
+                    assert!(!quantity, "{} is a condition, not a quantity", entity.key);
+                    assert!(entity.unit.is_none(), "{} is a condition and has no unit", entity.key);
+                }
+                other => panic!("{} is not a reading, a flags word or a signal: {other:?}", entity.key),
+            }
+        }
+    }
+
+    #[test]
+    fn the_way_to_supply_a_reading_is_not_gated_on_a_reading_existing() {
+        // The circularity this prevents: `meter_connected` is 1 only *because* a reading was supplied, so
+        // gating the control that supplies one on it would leave the only way in permanently unavailable.
+        let reading = Entity::meter_reading();
+        assert!(reading.gate.is_none(), "the reading input must stay reachable");
+
+        // Its two companions are gated, because both are meaningless with no reading held.
+        assert_eq!(
+            Entity::withdraw_meter_reading().gate,
+            Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED
+            })
+        );
+        let active = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == "meter_active_power")
+            .expect("mapped");
+        assert_eq!(
+            Entity::for_reading(active).expect("an entity").gate,
+            Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED
+            })
+        );
+    }
+
+    #[test]
+    fn a_register_nobody_can_interpret_is_not_published() {
+        let unknown = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name.starts_with("unknown_"))
+            .expect("the map carries unknown registers");
+        assert_eq!(Entity::for_reading(unknown), None);
+    }
+
+    #[test]
+    fn the_switch_that_stops_output_says_so() {
+        // It sits in a list of otherwise harmless switches, and the device page is where someone decides
+        // whether to touch it.
+        assert_eq!(setting("off_grid_mode").name, "Off-grid mode (stops AC output)");
+    }
+
+    #[test]
+    fn a_switch_with_no_observed_effect_carries_the_vendor_label() {
+        // The vendor's own wording, verbatim, and nothing beyond it. The device behaves identically with
+        // this set and clear (F151), so any name describing an effect would be inventing one.
+        assert_eq!(setting("ac_couple_enabled").name, "AC couple enable");
+        assert_eq!(setting("ac_couple_enabled").component, Component::Switch);
+    }
+
+    #[test]
+    fn a_slots_repeat_is_a_text_entity_named_after_the_vendors_own_field() {
+        // The register lives in a block of its own, away from the five contiguous slot registers, so the
+        // thing worth pinning is that a slot still yields it and that it lands where a person can type
+        // into it. `repeat` is the vendor application's name for the same field.
+        let repeat = setting("slot1_repeat");
+        assert_eq!(repeat.name, "Slot 1 repeat");
+        assert_eq!(repeat.component, Component::Text);
+        assert_eq!(setting("slot9_repeat").name, "Slot 9 repeat");
+    }
+
+    #[test]
+    fn names_read_as_prose() {
+        // Derived from the field name where that reads well, with a number that is stuck to a word read as
+        // the separate thing it is ...
+        assert_eq!(setting("slot1_output_power").name, "Slot 1 output power");
+        assert_eq!(reading("battery2_soc").name, "Battery 2 state of charge");
+        // ... acronyms kept as acronyms, including where a digit is stuck to one ...
+        assert_eq!(reading("pv1_voltage").name, "PV1 voltage");
+        // ... and spelled out where the field name would read badly.
+        assert_eq!(reading("battery_soc_total").name, "Battery state of charge");
+        assert_eq!(setting("charge_limit_upper").name, "Charge limit, upper");
+    }
+
+    #[test]
+    fn a_reading_claims_exactly_the_decimals_its_scaling_resolves() {
+        // Home Assistant's default for a voltage is no decimals, which rendered a cell voltage of 3.325 V
+        // as `3 V`. Claiming more than the scaling resolves would be the opposite mistake.
+        assert_eq!(reading("battery_cell_voltage_max").precision, Some(3));
+        assert_eq!(reading("pv1_voltage").precision, Some(2));
+        assert_eq!(reading("pv_energy_today").precision, Some(1));
+        assert_eq!(reading("battery1_temp").precision, Some(1));
+        // Whole quantities: the raw register already is the value.
+        assert_eq!(reading("ac_power").precision, Some(0));
+        assert_eq!(reading("battery_soc_total").precision, Some(0));
+        // Nothing to round.
+        assert_eq!(reading("work_mode").precision, None);
+        assert_eq!(setting("charge_limit_upper").precision, None);
+    }
+
+    #[test]
+    fn what_stays_in_diagnostics_is_about_the_equipment() {
+        // Confidence used to decide this, which filed most of the device under diagnostics — every pack's
+        // state of charge but the first, every string's voltage, the cycle count. Those are the readings a
+        // dashboard is built from.
+        for key in [
+            "internal_faults",
+            "battery_cell_voltage_max",
+            // An accessory an installation either has or has not, and the readback of a switch that is
+            // already on the page.
+            "smart_plug_connected",
+            "smart_plug_power",
+            "off_grid_mode_active",
+        ] {
+            assert_eq!(reading(key).category, Some(Category::Diagnostic), "{key}");
+        }
+        for key in [
+            "battery2_soc",
+            "pv1_voltage",
+            "pv1_current",
+            "device_temp",
+            "inverter_temp",
+            "grid_voltage",
+            "grid_current",
+            "battery_current",
+            "battery_cycles",
+            "battery_soh",
+            "battery_charge_status",
+            "battery_pack_count",
+            "ac_output_energy_today",
+            "pv_energy_month",
+            "household_load_total",
+        ] {
+            assert_eq!(reading(key).category, None, "{key} belongs on the dashboard");
+        }
+    }
+
+    #[test]
+    fn the_battery_current_is_the_only_reading_taken_on_the_dc_side() {
+        // Its point is that it is not `battery_charge_power`, which is measured past the converter, nor
+        // the state of charge, which comes from a gauge that drifts. Tenths of an amp, signed on 30 000,
+        // and it has to survive as a current rather than picking up the percentage or power treatment.
+        let current = reading("battery_current");
+        assert_eq!(current.device_class, Some("current"));
+        assert_eq!(current.unit, Some("A"));
+        assert_eq!(current.precision, Some(1));
+        assert_eq!(current.shape, Shape::Reading(Some(StateClass::Measurement)));
+
+        // Its other half, which makes DC power a multiplication rather than a guess at the cell count.
+        let volts = reading("battery_voltage");
+        assert_eq!(volts.device_class, Some("voltage"));
+        assert_eq!(volts.unit, Some("V"));
+        assert_eq!(volts.precision, Some(1));
+        assert_eq!(volts.category, None, "the pack voltage belongs on the dashboard");
+
+        // The inverter's temperature is a second temperature, not a rename of the device's.
+        assert_eq!(reading("inverter_temp").device_class, Some("temperature"));
+        assert_eq!(reading("inverter_temp").precision, Some(1));
+        assert_ne!(reading("inverter_temp").name, reading("device_temp").name);
+    }
+
+    #[test]
+    fn the_heater_state_is_shown_as_the_word_the_battery_sends() {
+        // One bit per pack, so which packs are heating reads at a glance in hexadecimal.
+        let heater = reading(HEATER_STATE);
+        assert_eq!(heater.component, Component::Sensor);
+        assert_eq!(heater.shape, Shape::Flags);
+        assert_eq!(heater.unit, None);
+        assert_eq!(heater.device_class, None);
+        assert_eq!(heater.category, Some(Category::Diagnostic));
+    }
+
+    #[test]
+    fn running_off_grid_is_reported_as_a_condition_not_as_a_number() {
+        // The device's own answer, beside the `off_grid_mode` switch that asks for it. A sensor reading
+        // `0` would make `is_state(..., 'on')` wrong in an automation, which is the whole reason
+        // `meter_connected` is a binary sensor too.
+        let active = reading(OFF_GRID_ACTIVE);
+        assert_eq!(active.component, Component::BinarySensor);
+        assert_eq!(active.unit, None);
+        assert!(matches!(active.shape, Shape::Signal { .. }), "{:?}", active.shape);
+        // Home Assistant writes the state in the class's words, and the device is not a connection:
+        // `running` reads "Running", `connectivity` would read "Connected".
+        assert_eq!(active.device_class, Some("running"));
+        assert_eq!(reading(METER_CONNECTED).device_class, Some("connectivity"));
+
+        // And it is not the switch: that one is a setting, and writing to the reading is not a thing.
+        assert_eq!(setting("off_grid_mode").component, Component::Switch);
+    }
+
+    #[test]
+    fn an_abbreviation_nobody_says_out_loud_is_spelled_out() {
+        // `SOC` on a diagnostics page asks the reader to know the field name. The numbered ones are exactly
+        // where they have the least context to expand it themselves.
+        for (key, expected) in [
+            ("battery1_soc", "Battery 1 state of charge"),
+            ("battery4_soc", "Battery 4 state of charge"),
+            ("battery_soc_total", "Battery state of charge"),
+        ] {
+            assert_eq!(reading(key).name, expected);
+        }
+    }
+
+    #[test]
+    fn a_power_that_is_an_output_says_so() {
+        // They read as one family beside the slot and default settings that command them.
+        assert_eq!(reading("ac_power").name, "AC output power");
+        assert_eq!(reading("on_grid_power").name, "On-grid output power");
+        assert_eq!(reading("off_grid_power").name, "Off-grid output power");
+        assert_eq!(setting("default_output_power").name, "Default output power");
+        assert_eq!(setting("slot1_output_power").name, "Slot 1 output power");
+
+        // The field names stay as the specification has them: they are what the state topic carries and
+        // what every capture contains.
+        assert_eq!(reading("ac_power").key, "ac_power");
+    }
+
+    #[test]
+    fn every_writable_register_becomes_a_writable_entity() {
+        // The catalogue must cover the whole allowlist: a setting the API accepts but Home Assistant
+        // cannot reach would be a silent gap between the two interfaces.
+        for register in HOLDING_REGISTERS {
+            let entity = Entity::for_setting(register);
+            assert!(entity.is_writable(), "{} is not writable", register.name);
+            assert_eq!(entity.key, register.name);
+        }
+        // Slots are generated rather than listed, so they are checked separately.
+        for slot in 1..=9u16 {
+            for register in HoldingRegister::slot(slot).expect("a slot in range") {
+                assert!(Entity::for_setting(&register).is_writable(), "slot {slot}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_named_reading_becomes_a_sensor() {
+        // Except the three kinds that are deliberately withheld: an unnamed register nobody can read, the
+        // serial split across four text registers, and the version parts published as one assembled
+        // string. Each exclusion is a decision, so the count states them rather than tolerating a
+        // shortfall.
+        let published = INPUT_REGISTERS.iter().filter_map(Entity::for_reading).count();
+        let named = INPUT_REGISTERS
+            .iter()
+            .filter(|entry| !entry.name.starts_with("unknown_") && !matches!(entry.kind, Kind::Text { .. }))
+            .count();
+        assert_eq!(published, named - VERSION_PARTS.len());
+        assert!(named > 30, "only {named} named registers");
+
+        for part in VERSION_PARTS {
+            let entry = INPUT_REGISTERS
+                .iter()
+                .find(|entry| entry.name == part)
+                .expect("a version part is a named register");
+            assert!(
+                Entity::for_reading(entry).is_none(),
+                "{part} carries two components in its octets and means nothing published alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reading_is_never_a_setting_by_accident() {
+        // Every telemetry entity is read-only; the two maps must not overlap in what they offer.
+        for register in INPUT_REGISTERS {
+            if let Some(entity) = Entity::for_reading(register) {
+                assert!(!entity.is_writable(), "{} should be read-only", register.name);
+            }
+        }
+        let _ = InputRegister::lookup(Register(5)).expect("ac_power exists");
+    }
+}

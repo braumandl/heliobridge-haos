@@ -1,0 +1,174 @@
+[package]
+name = "heliobridge"
+version = "0.9.1"
+edition = "2024"
+rust-version = "1.97"
+description = "Local MQTT bridge for the Growatt Nexa 2000 — Home Assistant without the cloud"
+repository = "https://github.com/longsleep/heliobridge"
+license = "Apache-2.0"
+authors = ["Simon Eisenmann"]
+readme = "README.md"
+keywords = ["growatt", "nexa", "mqtt", "home-assistant", "solar"]
+categories = ["network-programming", "embedded"]
+
+[lib]
+name = "heliobridge"
+path = "src/lib.rs"
+
+# The binary is auto-discovered from src/bin/heliobridge/main.rs. A second binary
+# is a second directory next to it — no Cargo.toml change needed.
+
+[dependencies]
+crc = "3.4"        # CRC_16_MODBUS predefined; hand-rolling this is a known trap
+snafu = "0.9.2"    # errors that cross a module boundary, with typed context
+thiserror = "2.0"  # leaf error types
+
+clap = { version = "4.6", features = ["derive", "env"] }
+# Local wall-clock time for the server time push. The device is sent *local* time, matching its own
+# clock, so a timezone-aware conversion is needed rather than arithmetic on a Unix timestamp.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The zone database, compiled in, so `TZ` resolves without one on the host. `chrono::Local` reads the
+# host's database and falls back to UTC when there is none.
+chrono-tz = { version = "0.10", default-features = false }
+tokio-stream = "0.1"    # the Stream trait (re-exported) and ReceiverStream
+async-stream = "0.3"    # authoring a Stream from async code; the config cursor is a generator
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+tracing = "0.1"
+# `log` so rustls's own records land in the same pipeline under the same filter.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
+
+# TLS. The device offers TLS 1.2 only, so `tls12` is not optional here.
+rustls = { version = "0.23", features = ["tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+
+# The control API: HTTP over a Unix socket, so it is reachable with curl and unreachable from the
+# network. Unlike the device-facing MQTT, nothing here is impersonating anything, so a well-maintained
+# library is simply the right answer.
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Trust anchors for the cloud relay. The device verifies nothing; this program is a proper client and
+# has no reason to be as lax.
+webpki-roots = "1.0.9"
+# Certificate generation. RSA rather than the default ECDSA: the device is known to accept an
+# RSA-2048 self-signed certificate with CN `*.growatt.com`, and matching what is known to work
+# keeps TLS from being a variable when something else goes wrong.
+rcgen = { version = "0.14.8", features = ["aws_lc_rs"] }
+rustls-native-certs = "0.8"
+url = "2"
+gethostname = "1.1.0"
+ipnet = "2.11"    # CIDR containment for the source allowlist
+
+# Fetching firmware the cloud advertises. hyper rather than a higher-level client because the request has
+# to look like the datalogger's own: a client that seeds its own `Accept` -- as reqwest does, and cannot be
+# talked out of -- would announce that something other than the device is reading the vendor's CDN. All
+# three are already in the tree behind axum and the TLS stack.
+http = "1"          # the request type, so the vendor-shaped request lives with the vendor knowledge
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+# TLS for that client. The vendor moved its update URLs from `http://` to `https://` in October 2026. No
+# default features: the connector is built from the program's own `ClientTls`, so it brings neither a trust
+# store nor a crypto provider of its own, and the CDN is checked against the same anchors as the relay.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
+sanitize-filename = "0.6"   # a vendor URL decides a file name; this keeps it a file name
+sha2 = "0.10"               # a digest of what was downloaded, so it can be compared with a known image
+
+[dev-dependencies]
+# `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without
+# waiting 4.5 seconds. Only enabled for tests.
+tokio = { version = "1", features = ["test-util"] }
+# The discovery patterns are read by Home Assistant's regex engine, not by this crate, so a test that
+# reimplements them by hand only ever checks the reimplementation. Matching them for real is what makes
+# the assertion mean something, and as a dev-dependency none of it reaches the shipped binary.
+regex = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# Deliberately NOT panic = "abort": a panicking tokio task should lose that task,
+# not take the whole daemon down with it.
+
+# ---------------------------------------------------------------------------
+# Lints
+#
+# Declared here rather than as crate-root attributes so they apply uniformly to
+# the library, the binary, tests and benches. Group lints carry priority = -1 so
+# the individual entries below can override them.
+# ---------------------------------------------------------------------------
+
+[lints.rust]
+unsafe_code = "forbid"
+
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+unused_import_braces = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+non_ascii_idents = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# --- Panics. This is a daemon that must stay up; a panic is lost telemetry. ---
+unwrap_used = "deny"
+expect_used = "warn"      # acceptable during startup, where failing loudly is right
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"     # output goes through tracing, not println!
+print_stderr = "warn"
+
+# --- The decode path. Every one of these corresponds to a bug this protocol
+#     work actually hit by hand: a bad slice index, an inverted scale factor,
+#     a truncating cast. ---
+indexing_slicing = "deny"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+integer_division = "warn"
+float_cmp = "deny"
+lossy_float_literal = "warn"
+
+# --- Not actionable here ---
+# `snafu` and `thiserror` pull different major versions of `syn` through their proc-macro
+# dependencies. Nothing in this crate can resolve that, and the lint would otherwise fail the
+# build on a transitive fact. Revisit if the dependency tree converges.
+multiple_crate_versions = "allow"
+
+# --- Hygiene ---
+mod_module_files = "warn"  # foo.rs + foo/ , never foo/mod.rs
+str_to_string = "warn"     # `string_to_string` was removed in 1.97; `implicit_clone` (pedantic) covers it
+verbose_file_reads = "warn"
+empty_enum_variants_with_brackets = "warn"
+
+# --- Pedantic/nursery lints that are noise rather than signal here. Each of
+#     these is allowed on purpose; the reason matters more than the entry. ---
+module_name_repetitions = "allow"  # heliobridge::bridge::* is the plan's taxonomy
+must_use_candidate = "allow"       # fires on almost every getter
+missing_const_for_fn = "allow"     # nursery; churns as the body changes
+option_if_let_else = "allow"       # nursery; frequently less readable than the original
