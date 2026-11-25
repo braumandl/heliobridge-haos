@@ -1,44 +1,46 @@
 # Heliobridge – Home Assistant OS App
 
-Diese App paketiert die Originalsoftware [Heliobridge von Simon Eisenmann](https://github.com/longsleep/heliobridge) für Home Assistant OS.
+[English](README.md) · [Deutsch](README.de.md)
 
-Sie stellt eine lokale TLS-/MQTT-Bridge für den Growatt NEXA 2000 bereit und veröffentlicht Gerätedaten über den Home-Assistant-MQTT-Dienst und MQTT Discovery.
+This app packages the original [Heliobridge software by Simon Eisenmann](https://github.com/longsleep/heliobridge) for Home Assistant OS.
 
-## Voraussetzungen
+It provides a local TLS/MQTT bridge for the Growatt NEXA 2000 and publishes device data through the Home Assistant MQTT service and MQTT Discovery.
 
-- Home Assistant OS mit Supervisor auf der in `config.yaml` aufgeführten Architektur `amd64`.
-- Installierter und laufender Home-Assistant-MQTT-Dienst.
-- Netzwerkverbindung vom NEXA-Datenlogger zum Home-Assistant-Host auf TCP-Port `7006`.
+## Requirements
+
+- Home Assistant OS with Supervisor on the `amd64` architecture listed in `config.yaml`.
+- Installed and running Home Assistant MQTT service.
+- Network connectivity from the NEXA data logger to the Home Assistant host on TCP port `7006`.
 
 ## Installation
 
-1. Das Repository `https://github.com/braumandl/heliobridge-haos` zum Home-Assistant-App-Store hinzufügen.
-2. Die App **Heliobridge** auswählen und installieren.
-3. Konfiguration prüfen und App starten.
-4. App-Protokoll auf MQTT-Verbindung und Start des TLS-Listeners prüfen.
+1. Add the repository `https://github.com/braumandl/heliobridge-haos` to the Home Assistant app store.
+2. Select and install the **Heliobridge** app.
+3. Review the configuration and start the app.
+4. Check the app log for the MQTT connection and the TLS listener startup.
 
-Die Heliobridge Updater-App ist eine separate optionale App und muss bei Bedarf zusätzlich installiert werden.
+The Heliobridge Updater app is a separate optional app and must be installed separately if required.
 
-## Optionen
+## Options
 
-| Option | Standardwert | Bedeutung |
+| Option | Default | Description |
 |---|---:|---|
-| `allow_writes` | `false` | Schreibende Steuerbefehle erlauben |
-| `allow_power_plus` | `false` | Power+-Schreibfunktionen aktivieren |
-| `cloud_relay` | `false` | Growatt-Cloud-Relay aktivieren |
-| `relay_mode` | `controls` | Relay-Modus: `full`, `controls` oder `observer` |
-| `allow_from` | leer | Optionale Quell-IP-/Netzwerk-Allowlist |
-| `allow_devices` | leer | Optionale Allowlist von Geräte-Seriennummern |
-| `slots` | `1` | Anzahl der Zeitplan-Slots (1–9) |
-| `offline_after` | `30` | Sekunden ohne Telemetrie bis offline |
-| `mqtt_base` | `heliobridge` | MQTT-Basis-Topic |
-| `mqtt_discovery_prefix` | `homeassistant` | MQTT-Discovery-Präfix |
-| `timezone` | `Europe/Berlin` | Zeitzone |
-| `log_level` | `info` | Protokollierungsstufe |
+| `allow_writes` | `false` | Allow write/control commands |
+| `allow_power_plus` | `false` | Enable Power+ write functions |
+| `cloud_relay` | `false` | Enable Growatt cloud relay |
+| `relay_mode` | `controls` | Relay mode: `full`, `controls`, or `observer` |
+| `allow_from` | empty | Optional source IP/network allowlist |
+| `allow_devices` | empty | Optional device serial number allowlist |
+| `slots` | `1` | Number of schedule slots (1–9) |
+| `offline_after` | `30` | Seconds without telemetry before offline |
+| `mqtt_base` | `heliobridge` | MQTT base topic |
+| `mqtt_discovery_prefix` | `homeassistant` | MQTT Discovery prefix |
+| `timezone` | `Europe/Berlin` | Time zone |
+| `log_level` | `info` | Logging level |
 
-### Sicherheitsdefaults
+### Security defaults
 
-Die schreibenden Funktionen und das Cloud-Relay sind standardmäßig deaktiviert:
+Write functions and the cloud relay are disabled by default:
 
 ```yaml
 allow_writes: false
@@ -46,26 +48,26 @@ allow_power_plus: false
 cloud_relay: false
 ```
 
-Leere Werte bei `allow_from` und `allow_devices` bedeuten im gebündelten Upstream-Code, dass anhand dieser Listen keine Einschränkung vorgenommen wird. Leere Listen sind daher keine Deny-all-Sperre.
+In the bundled upstream code, empty values for `allow_from` and `allow_devices` mean that no restriction is applied based on these lists. Empty lists are therefore not a deny-all rule.
 
-## Netzwerkumleitung
+## Network redirection
 
-Der NEXA-Datenlogger muss auf die lokale Bridge umgeleitet werden. Das Upstream-Projekt dokumentiert:
+The NEXA data logger must be redirected to the local bridge. The upstream project documents:
 
-- DNS-Override für `mqtt.growatt.com` auf die IP-Adresse des Home-Assistant-Hosts, oder
-- Destination-NAT auf den Home-Assistant-Host und TCP-Port `7006`.
+- a DNS override for `mqtt.growatt.com` to the IP address of the Home Assistant host, or
+- destination NAT to the Home Assistant host on TCP port `7006`.
 
-Die App richtet diese Netzwerkregeln nicht selbst ein und verändert keine NEXA-Endpoint-Register. Richte DNS/NAT erst ein, nachdem die App startet und ihre MQTT-Verbindung erfolgreich hergestellt hat.
+The app does not configure these network rules itself and does not modify NEXA endpoint registers. Configure DNS/NAT only after the app starts and its MQTT connection has been established successfully.
 
-## Diagnose
+## Troubleshooting
 
-- MQTT-Verbindung im App-Protokoll kontrollieren.
-- Prüfen, ob TCP-Port `7006` lauscht.
-- Prüfen, ob der NEXA-Datenlogger tatsächlich eine TLS-Verbindung aufbaut.
-- MQTT Discovery und das konfigurierte Discovery-Präfix kontrollieren.
+- Check the MQTT connection in the app log.
+- Check that TCP port `7006` is listening.
+- Check whether the NEXA data logger actually establishes a TLS connection.
+- Check MQTT Discovery and the configured Discovery prefix.
 
-Ein erfolgreicher TCP-Watchdog-Test bestätigt nur, dass der Listener erreichbar ist. Er beweist nicht, dass ein NEXA-Gerät verbunden ist oder gültige Telemetrie und MQTT-Discovery-Daten veröffentlicht werden.
+A successful TCP watchdog test confirms only that the listener is reachable. It does not prove that a NEXA device is connected or that valid telemetry and MQTT Discovery data are being published.
 
-## Zurück zur Growatt-Cloud
+## Return to the Growatt cloud
 
-Die App stoppen und den eingerichteten DNS-Override für `mqtt.growatt.com` bzw. die Destination-NAT-Regel entfernen. Dieses Paket verändert keine NEXA-Endpoint-Register.
+Stop the app and remove the configured DNS override for `mqtt.growatt.com` or the destination NAT rule. This package does not modify NEXA endpoint registers.
