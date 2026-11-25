@@ -1,0 +1,2060 @@
+//! The tasks that keep Home Assistant informed.
+//!
+//! [`Publisher`] owns the broker connection and does the two things that are not about any one device:
+//! saying whether this program is running, and starting a [`Link`] for each device that connects.
+//! Everything else belongs to a link, one task per device, so a device that goes quiet holds nothing up.
+//!
+//! # A device task, not a loop over devices
+//!
+//! Each link watches one session's telemetry, settings and identity, and holds its own watchdog timer. A
+//! shared loop would have to poll every device on a common tick, which is the wrong shape twice over: it
+//! adds latency to a frame that already arrived, and it makes one device's silence everyone's problem.
+//!
+//! # Nothing is published for a device that is not reporting
+//!
+//! Not zero, and not the last value again. A zero on an energy counter reads as a counter reset and gives
+//! the Energy dashboard a spike the size of the day's total; a repeated value is a flat line
+//! indistinguishable from a real one. Instead the device's availability topic goes to `offline` and Home
+//! Assistant records a gap, which is what actually happened.
+
+use core::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, SessionId, TelemetryView};
+use crate::driver::catalogue::Catalogue as Registers;
+use crate::driver::describes::Describes;
+use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
+use crate::homeassistant::command::{Change, Delivery, Permitted};
+use crate::homeassistant::discovery::{DeviceBlock, Discovery};
+use crate::homeassistant::entity::{Catalogue, Component, Entity, FIRMWARE_VERSION, Gate, LAST_UPDATE, Source};
+use crate::homeassistant::rest::RestWatch;
+use crate::homeassistant::state::{Fields, StatePayload};
+use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
+
+/// How long without a telemetry frame before the device is reported absent.
+///
+/// Six missed cycles. The device's own MQTT keepalive is 420 s, so waiting for the protocol to notice a
+/// half-open connection would leave stale readings on a dashboard for seven minutes; telemetry every five
+/// seconds is a far better heartbeat than the keepalive.
+pub const OFFLINE_AFTER: Duration = Duration::from_secs(30);
+
+/// How many devices may end a session between one wake-up of the publisher and the next.
+///
+/// Sessions end at human pace even for a device that reconnects aggressively.
+const FAREWELL_DEPTH: usize = 16;
+
+/// What to publish, as against where.
+#[derive(Debug, Clone, Copy)]
+pub struct PublisherOptions {
+    /// How many schedule slots get entities, 1–9.
+    pub slots: u16,
+    /// What a command topic may change.
+    ///
+    /// The same answer decides both halves: a setting that may not be written is not published as a
+    /// control, and a command naming it is refused. Publishing a control that would be refused, or
+    /// accepting a command for a control that was never offered, are the two ways for those to disagree.
+    pub permitted: Permitted,
+    /// How long without a telemetry frame before the device is reported absent.
+    pub offline_after: Duration,
+}
+
+impl Default for PublisherOptions {
+    fn default() -> Self {
+        Self {
+            slots: 1,
+            permitted: Permitted::default(),
+            offline_after: OFFLINE_AFTER,
+        }
+    }
+}
+
+/// Which broker connection is current.
+///
+/// Zero means there has never been one, and a link publishes nothing until there has: queueing a discovery
+/// burst at a broker that is down would fill the queue with messages that are stale by the time it comes
+/// back. Every change means "say everything again", which is what makes a broker restart, a network blip
+/// and a first start one case instead of three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+struct Generation(u64);
+
+impl Generation {
+    /// Whether the broker has ever been reached.
+    const fn is_established(self) -> bool {
+        self.0 > 0
+    }
+
+    /// The next one. Saturating: after 2^64 broker connections, staying at the last is harmless — links
+    /// republish on change, and a counter that stopped changing only means they stop being asked to.
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+/// Publishes device state to Home Assistant, and accepts commands back.
+#[derive(Debug)]
+pub struct Publisher<D> {
+    /// The driver whose catalogue says what to publish, and what the device is.
+    driver: Arc<D>,
+    broker: Broker,
+    topics: Arc<Topics>,
+    registry: Registry,
+    options: PublisherOptions,
+    devices: watch::Receiver<Connected>,
+    /// Bumped on every broker connection, so every link republishes what the broker retains.
+    generation: watch::Sender<Generation>,
+    /// Devices with a link running, so a second one is never started for the same session.
+    linked: HashMap<String, Linked>,
+    /// How a link reports that its session ended.
+    farewell: mpsc::Sender<(String, SessionId)>,
+    /// Where those reports arrive.
+    ended: mpsc::Receiver<(String, SessionId)>,
+}
+
+/// A running link, and which session it publishes for.
+///
+/// The session is what makes this more than a set of serials: a link holds one session's channels, so a
+/// device that has reconnected needs a *new* link even though nothing about the connected set changed.
+#[derive(Debug)]
+struct Linked {
+    /// The session whose telemetry, settings and identity the link watches.
+    session: SessionId,
+    /// The task, so a link whose session has been replaced can be stopped instead of left publishing.
+    task: JoinHandle<()>,
+}
+
+impl<D: Registers + Describes> Publisher<D> {
+    /// Connect to the broker and start publishing.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Broker::connect`] reports. A broker that is merely unreachable is not an error: the
+    /// client retries in the background.
+    pub fn start(
+        mut config: BrokerConfig,
+        topics: Topics,
+        registry: Registry,
+        options: PublisherOptions,
+        driver: Arc<D>,
+    ) -> Result<Self, BrokerError> {
+        config.will = Some(topics.will());
+        config.subscriptions = vec![topics.command_filter()];
+
+        let devices = registry.watch();
+        let (farewell, ended) = mpsc::channel(FAREWELL_DEPTH);
+        Ok(Self {
+            driver,
+            broker: Broker::connect(config)?,
+            topics: Arc::new(topics),
+            registry,
+            options,
+            devices,
+            generation: watch::Sender::new(Generation::default()),
+            linked: HashMap::new(),
+            farewell,
+            ended,
+        })
+    }
+
+    /// Run until the broker client stops.
+    pub async fn run(mut self) {
+        loop {
+            tokio::select! {
+                event = self.broker.next_event() => {
+                    let Some(event) = event else {
+                        tracing::warn!("the broker client stopped; Home Assistant will not be updated");
+                        return;
+                    };
+                    self.handle(event);
+                }
+
+                changed = self.devices.changed() => {
+                    if changed.is_err() {
+                        // The registry is gone, which means the program is shutting down.
+                        return;
+                    }
+                    self.devices.borrow_and_update();
+                    self.link_devices();
+                }
+
+                ended = self.ended.recv() => {
+                    // The channel cannot close while this holds the sender.
+                    if let Some((device, session)) = ended {
+                        self.session_ended(&device, session);
+                    }
+                }
+            }
+        }
+    }
+
+    /// React to something the broker reported.
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Connected => {
+                self.publish(Publication::retained(self.topics.bridge_availability(), ONLINE));
+                // Every link now says everything again, which is also what starts the first one talking.
+                self.generation.send_modify(|current| *current = current.next());
+                self.link_devices();
+            }
+            Event::Message { topic, payload } => {
+                if let Some(device) = self.topics.device_of_command(&topic) {
+                    self.handle_command(&device, &payload);
+                } else {
+                    tracing::debug!(%topic, "ignoring a message on an unexpected topic");
+                }
+            }
+        }
+    }
+
+    /// Start a link for every connected device that has none, and replace one whose session has changed.
+    ///
+    /// Called whenever anything might have changed rather than only on a device arriving, because the set
+    /// of connected *serials* does not change when a device reconnects — the registry replaces the session
+    /// behind the same serial.
+    ///
+    /// **A link left on a replaced session publishes nothing ever again.** It watches that session's
+    /// channels, and they stay open for as long as the task that owns them lives, so it neither sees the
+    /// new session's frames nor exits: a half-open socket has been measured lingering ten minutes, and a
+    /// device that reconnects repeatedly can hold its own slot indefinitely. Whatever was last said about
+    /// the device stands for the whole of it — `offline`, if the watchdog had already fired. So the session
+    /// is compared, not just the serial, and the link left behind is stopped rather than waited for.
+    fn link_devices(&mut self) {
+        // Owned, because linking a device mutates what this walks the snapshot to decide.
+        let connected: Vec<String> = self.devices.borrow().devices().map(str::to_owned).collect();
+        for device in connected {
+            // Which session serves it *now*, from the registry rather than from the snapshot: the snapshot
+            // says a change happened, and can itself be a reconnect out of date by the time this runs.
+            let Some((session, handle)) = self.registry.session(&device) else {
+                continue;
+            };
+            if self.linked.get(&device).is_some_and(|linked| linked.session == session) {
+                continue;
+            }
+            // A session that has already dropped its request channel is on its way out. Its own link would
+            // exit immediately; skipping it leaves the work to the registration that replaces it.
+            if handle.requests.is_closed() {
+                tracing::debug!(%device, "not linking a session that is ending");
+                continue;
+            }
+
+            // Before the task is spawned, so this line precedes the link's own however the runtime
+            // schedules it. The log is the record of what happened to a device, and it reads in order.
+            if self.linked.contains_key(&device) {
+                tracing::info!(%device, "the device reconnected; announcing it again for its new session");
+            } else {
+                tracing::info!(%device, "device connected; announcing it to Home Assistant");
+            }
+
+            let task = tokio::spawn(
+                Link {
+                    driver: Arc::clone(&self.driver),
+                    device: device.clone(),
+                    session_id: session,
+                    session: handle,
+                    publications: self.broker.publications(),
+                    topics: Arc::clone(&self.topics),
+                    options: self.options,
+                    generation: self.generation.subscribe(),
+                    farewell: self.farewell.clone(),
+                    published_for: None,
+                    announced: None,
+                    arrived: None,
+                    last_update: None,
+                    present: false,
+                    fields: Fields::default(),
+                    gates: HashMap::new(),
+                    rest: RestWatch::default(),
+                }
+                .run(),
+            );
+
+            // A link left behind by a reconnect is stopped rather than waited for. Nothing else would stop
+            // it — it is not waiting on anything that has ended — and both links publish to the same
+            // topics, so leaving it running lets a dead session's idea of the device overwrite a live
+            // one's.
+            if let Some(replaced) = self.linked.insert(device.clone(), Linked { session, task }) {
+                replaced.task.abort();
+            }
+        }
+    }
+
+    /// A device's session ended.
+    ///
+    /// Its readings are reported gone rather than left at their last value, and a link is started again if
+    /// the device has meanwhile reconnected.
+    ///
+    /// A farewell from a session that has already been replaced says nothing about the device: the link for
+    /// the session serving it now is running, and reporting *that* one's device offline would take a live
+    /// dashboard down on the strength of a socket closing minutes late.
+    fn session_ended(&mut self, device: &str, session: SessionId) {
+        if self.linked.get(device).is_some_and(|linked| linked.session != session) {
+            tracing::debug!(%device, "a replaced session ended; the device is served by a newer one");
+            return;
+        }
+
+        tracing::info!(%device, "device session ended");
+        self.linked.remove(device);
+        self.publish(Publication::retained(self.topics.device_availability(device), OFFLINE));
+        self.publish(StatePayload::status(false).retained(self.topics.status(device)));
+        self.link_devices();
+    }
+
+    /// Carry out a command that arrived on a device's command topic.
+    ///
+    /// Parsed here so a refusal is logged next to the message that caused it, and applied in a task of its
+    /// own because a write waits for the device to be read back — up to twenty seconds, which is far too
+    /// long to hold a loop that is also publishing telemetry.
+    ///
+    /// Nothing is published in reply. The read-back updates the session's settings cache, the link watching
+    /// it publishes the confirmed value, and Home Assistant learns what the device actually stored rather
+    /// than what it was asked for.
+    fn handle_command(&self, device: &str, payload: &[u8]) {
+        let Some(session) = self.registry.handle(device) else {
+            // Expected on a broker carrying more than one bridge: the command topic is a wildcard, so
+            // every bridge sees every device's commands and answers only for its own.
+            tracing::debug!(%device, "ignoring a command for a device this bridge does not serve");
+            return;
+        };
+
+        let changes = match Change::from_payload(payload, self.options.permitted, self.driver.as_ref()) {
+            Ok(changes) => changes,
+            Err(error) => {
+                tracing::warn!(%device, %error, "refusing a command");
+                return;
+            }
+        };
+
+        let device = device.to_owned();
+        tokio::spawn(async move {
+            for change in changes {
+                apply(&session, &device, change).await;
+            }
+        });
+    }
+
+    /// Queue a publication.
+    fn publish(&mut self, publication: Publication) {
+        self.broker.try_publish(publication);
+    }
+}
+
+/// Everything published about one device.
+///
+/// One of these per connected session, holding what has been said so far so that a change can be published
+/// as a difference rather than as a repetition: discovery goes out again only when the device's own
+/// description changes, and availability only when presence does.
+#[derive(Debug)]
+struct Link<D> {
+    driver: Arc<D>,
+    device: String,
+    session: SessionHandle,
+    /// Which session that is, so a farewell arriving after the session was replaced can be told from the
+    /// farewell of the session serving the device now.
+    session_id: SessionId,
+    publications: Publications,
+    topics: Arc<Topics>,
+    options: PublisherOptions,
+    generation: watch::Receiver<Generation>,
+    farewell: mpsc::Sender<(String, SessionId)>,
+    /// The broker connection everything currently published was published for.
+    published_for: Option<Generation>,
+    /// What the discovery messages on the broker describe.
+    announced: Option<Announcement>,
+    /// When the last telemetry frame arrived, on the timer's clock. `None` before the first.
+    arrived: Option<Instant>,
+    /// The same moment as a timestamp, for the sensor that reports staleness.
+    last_update: Option<String>,
+    /// Whether the device is currently reported as reporting.
+    present: bool,
+    /// Which fields the announced entities read.
+    fields: Fields,
+    /// What was last published to each gated entity's availability topic.
+    gates: HashMap<&'static str, &'static [u8]>,
+    /// How long the pack has been idle, and the last cell voltage measured while it was.
+    rest: RestWatch,
+}
+
+/// What the discovery messages on the broker describe.
+#[derive(Debug)]
+struct Announcement {
+    device: DeviceBlock,
+    catalogue: Catalogue,
+    /// Kept so an entity that leaves the catalogue can be withdrawn by name and component.
+    entities: Vec<Entity>,
+    /// The catalogue turned inside out, so publishing needs no lookups.
+    indexed: Indexed,
+}
+
+/// The catalogue indexed by the field that decides each thing, rather than by entity.
+///
+/// Built once per announcement. Publishing then walks the values that arrived and asks what each one
+/// decides, which is one pass with constant-time lookups — where asking each entity to find its own value
+/// would be a scan of every value per entity, on a path that runs again on every telemetry frame.
+#[derive(Debug, Default)]
+struct Indexed {
+    /// Settings published on a topic of their own. The entity key and the setting name are the same string.
+    unshared: HashSet<&'static str>,
+    /// Entities gated on a setting: the deciding name, then each entity and the values that make it inert.
+    gated_by_setting: HashMap<&'static str, Vec<(&'static str, &'static [u16])>>,
+    /// Entities gated on a reading: the deciding name, then each entity.
+    gated_by_reading: HashMap<&'static str, Vec<&'static str>>,
+}
+
+impl Indexed {
+    /// Index a catalogue.
+    fn of(entities: &[Entity]) -> Self {
+        let mut indexed = Self::default();
+        for entity in entities {
+            if entity.source == Some(Source::Settings) && entity.published_alone() {
+                indexed.unshared.insert(entity.key);
+            }
+            match entity.gate {
+                Some(Gate::SettingIsNot { setting, values }) => indexed
+                    .gated_by_setting
+                    .entry(setting)
+                    .or_default()
+                    .push((entity.key, values)),
+                Some(Gate::ReadingIsSet { reading }) => {
+                    indexed.gated_by_reading.entry(reading).or_default().push(entity.key);
+                }
+                None => {}
+            }
+        }
+        indexed
+    }
+}
+
+impl Announcement {
+    /// Whether this is still what a discovery message would say.
+    fn describes(&self, device: &DeviceBlock, catalogue: Catalogue) -> bool {
+        self.device == *device && self.catalogue == catalogue
+    }
+}
+
+impl<D: Registers + Describes> Link<D> {
+    /// Publish for this device until its session ends.
+    async fn run(mut self) {
+        // Marked seen without being published: a frame that was already in the channel arrived at an
+        // unknown time, and treating it as fresh would be inventing a timestamp.
+        self.session.telemetry.borrow_and_update();
+
+        // The connection that is already up counts. A link is started when a device connects, which is
+        // usually *after* the broker connection it publishes over, and `changed()` reports only what
+        // happens from here on — so waiting for one would mean waiting for the broker to drop.
+        let current = *self.generation.borrow_and_update();
+        self.republish(current);
+
+        loop {
+            // Recomputed each time round, because each frame moves it.
+            let quiet_at = self.quiet_at();
+
+            tokio::select! {
+                changed = self.generation.changed() => {
+                    if changed.is_err() {
+                        // The publisher is gone, so there is nowhere to publish.
+                        return;
+                    }
+                    let generation = *self.generation.borrow_and_update();
+                    self.republish(generation);
+                }
+
+                changed = self.session.telemetry.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.telemetry_arrived();
+                }
+
+                changed = self.session.settings.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.settings_changed();
+                }
+
+                changed = self.session.identity.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    // A device that has just said what model it is deserves a device page that says so.
+                    self.announce();
+                    self.publish_config();
+                }
+
+                () = async move {
+                    match quiet_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        // Either nothing has arrived yet, or the device has already been reported absent.
+                        // Both mean there is nothing this timer could change.
+                        None => core::future::pending().await,
+                    }
+                } => {
+                    self.went_quiet();
+                }
+            }
+        }
+
+        // Not the availability topic: the publisher owns that, so the same message is not published from
+        // two places, and so it is still published if this task is torn down rather than ending.
+        let ended = (self.device, self.session_id);
+        drop(self.farewell.send(ended).await);
+    }
+
+    /// Say everything the broker retains, for a connection that has just been established.
+    fn republish(&mut self, generation: Generation) {
+        if !generation.is_established() {
+            return;
+        }
+        tracing::debug!(device = %self.device, "republishing everything for a new broker connection");
+        // Discovery is keyed on what it describes, not on the connection, so the record of what was
+        // announced is cleared to force it out again.
+        self.announced = None;
+        self.published_for = Some(generation);
+
+        self.announce();
+        self.publish_presence();
+        self.settings_changed();
+        // Only if it is still current. A frame from before the outage is not state.
+        let current = self.fresh().then(|| self.session.telemetry.borrow().clone()).flatten();
+        if let Some(view) = current {
+            self.publish_telemetry(&view);
+        }
+    }
+
+    /// The settings cache changed.
+    ///
+    /// Three publishes rather than one: the shared object, the settings that cannot share it, and which
+    /// controls a setting has just made inert.
+    fn settings_changed(&mut self) {
+        self.publish_settings();
+        self.publish_unshared_settings();
+        self.publish_gates();
+    }
+
+    /// A telemetry frame arrived.
+    ///
+    /// Buffered records never reach here: the session decodes those and publishes nothing, since one is a
+    /// sample the device took up to an hour earlier and replayed on connect.
+    fn telemetry_arrived(&mut self) {
+        let view = self.session.telemetry.borrow_and_update().clone();
+        let Some(view) = view else {
+            return;
+        };
+
+        self.arrived = Some(Instant::now());
+        // Arrival here rather than the device's own clock, which is set by whoever pushed it last and has
+        // been seen disagreeing. A staleness sensor that jumps because the device is wrong about the time
+        // is worse than none.
+        self.last_update = Some(crate::server::clock::Zone::current().now().to_rfc3339());
+
+        // A pack count that has changed adds or removes per-pack entities, so this comes first.
+        self.announce();
+        if !self.present {
+            self.present = true;
+            tracing::info!(device = %self.device, "device is reporting");
+        }
+        // Every frame, not only the one that changes presence: the staleness sensor is what makes a reading
+        // that looks wrong answerable, and it moves each time.
+        self.publish_presence();
+        self.publish_telemetry(&view);
+        self.publish_gates();
+    }
+
+    /// When this device should be reported absent, if timing that is worth anything.
+    ///
+    /// `None` once it has been reported absent, and that is load-bearing rather than tidy. The link
+    /// recomputes this on every pass round its loop, and [`Self::went_quiet`] deliberately leaves
+    /// [`Self::arrived`] alone — so a deadline kept past the moment it fired would be re-armed on an
+    /// instant already behind us, complete as soon as it was awaited, and spin the link on a core until
+    /// the device came back. It would go unnoticed: every other branch is still served correctly, and
+    /// `went_quiet` is idempotent, so nothing is logged or published the second time.
+    fn quiet_at(&self) -> Option<Instant> {
+        self.present
+            .then_some(self.arrived)
+            .flatten()
+            .and_then(|at| at.checked_add(self.options.offline_after))
+    }
+
+    /// The device has been quiet too long.
+    ///
+    /// The socket may still look alive — that is the case this exists for — so nothing about the session is
+    /// touched. Only what is said about it changes.
+    fn went_quiet(&mut self) {
+        if !self.present {
+            return;
+        }
+        self.present = false;
+        tracing::warn!(
+            device = %self.device,
+            quiet_for_s = self.options.offline_after.as_secs(),
+            "no telemetry; reporting the device absent so its readings go unavailable rather than stale"
+        );
+        self.publish_presence();
+    }
+
+    /// Whether the last frame is recent enough to be current state.
+    fn fresh(&self) -> bool {
+        self.arrived.is_some_and(|at| at.elapsed() < self.options.offline_after)
+    }
+
+    /// Publish discovery, if what it would say has changed.
+    ///
+    /// Idempotent by design: it is called whenever anything that feeds a discovery message might have
+    /// moved, and compares before publishing. Announcing sixty entities on every telemetry frame would be
+    /// sixty retained writes every five seconds.
+    fn announce(&mut self) {
+        if self.published_for.is_none() {
+            return;
+        }
+        let device = DeviceBlock::new(
+            &self.device,
+            self.session.identity.borrow().as_ref(),
+            self.driver.as_ref(),
+        );
+        let catalogue = Catalogue {
+            slots: self.options.slots,
+            permitted: self.options.permitted,
+            packs: self.packs(),
+        };
+        if self
+            .announced
+            .as_ref()
+            .is_some_and(|announced| announced.describes(&device, catalogue))
+        {
+            return;
+        }
+
+        let entities = catalogue.entities(self.driver.as_ref());
+        let withdrawn = self.withdraw(&entities);
+        tracing::info!(
+            device = %self.device,
+            entities = entities.len(),
+            withdrawn,
+            packs = catalogue.packs,
+            "announcing entities to Home Assistant"
+        );
+        for entity in &entities {
+            let publication = Discovery {
+                entity,
+                topics: &self.topics,
+                device: &device,
+            }
+            .publication();
+            self.publish(publication);
+        }
+
+        self.fields = Fields::of(&entities);
+        let indexed = Indexed::of(&entities);
+        self.announced = Some(Announcement {
+            device,
+            catalogue,
+            entities,
+            indexed,
+        });
+    }
+
+    /// Withdraw the entities Home Assistant has been told about that are no longer in the catalogue.
+    ///
+    /// An empty retained payload on a discovery topic is how a discovered entity is removed; without it the
+    /// entity stays on the device page forever, with a state nothing will ever publish again.
+    ///
+    /// The first announcement of a session reconciles against **every entity the register maps can
+    /// produce**, not against what this process said, because it has said nothing yet — and the broker may
+    /// still be holding whatever a previous run left there. A second battery announced before the device
+    /// said it has one is exactly that case.
+    fn withdraw(&mut self, keeping: &[Entity]) -> usize {
+        // Whether this is the first announcement of the session, which is the one that has to assume the
+        // broker holds whatever some other run left there.
+        let first = self.announced.is_none();
+        let previous = match self.announced.take() {
+            Some(announced) => announced.entities,
+            None => Catalogue::everything(self.driver.as_ref()),
+        };
+
+        let retired = if first {
+            Catalogue::retired(self.driver.as_ref())
+        } else {
+            Vec::new()
+        };
+        let gone = Self::retractions(&previous, keeping, &retired);
+
+        for (component, key) in &gone {
+            let topic = self.topics.discovery(*component, &self.device, key);
+            self.publish(Publication::retained(topic, Vec::new()));
+        }
+        gone.len()
+    }
+
+    /// Which discovery topics need an empty retained payload.
+    ///
+    /// Pure, and separated from the publishing so the sweep of [`Catalogue::retired`] can be driven with a
+    /// synthetic entry: the real list only matters on a broker that still holds an old release's messages,
+    /// which no test here has.
+    fn retractions(
+        previous: &[Entity],
+        keeping: &[Entity],
+        retired: &[(Component, &'static str)],
+    ) -> Vec<(Component, &'static str)> {
+        let kept = |component: Component, key: &str| {
+            keeping
+                .iter()
+                .any(|entity| entity.key == key && entity.component == component)
+        };
+
+        let mut gone: Vec<(Component, &'static str)> = previous
+            .iter()
+            .filter(|entity| !kept(entity.component, entity.key))
+            .map(|entity| (entity.component, entity.key))
+            .collect();
+
+        // Entities this program used to publish. They cannot appear in `previous` — the catalogue is built
+        // from the code and their constructors are gone — so without this the retained discovery message
+        // outlives every trace of the entity that produced it.
+        for entry in retired {
+            if !kept(entry.0, entry.1) && !gone.contains(entry) {
+                gone.push(*entry);
+            }
+        }
+        gone
+    }
+
+    /// How many battery packs to publish entities for.
+    ///
+    /// What the device reports, and one until it has: it is a battery, so it has at least that. Not an
+    /// `Option`, because "unknown" and "one" would build two catalogues with identical contents — and each
+    /// distinct catalogue costs an announcement of every entity in it.
+    fn packs(&self) -> u16 {
+        self.session
+            .telemetry
+            .borrow()
+            .as_ref()
+            .and_then(|view| reading(view, "battery_pack_count"))
+            .unwrap_or(1)
+    }
+
+    /// Publish whether the device is reporting, and how stale its readings are.
+    fn publish_presence(&mut self) {
+        let availability = if self.present { ONLINE } else { OFFLINE };
+        let topic = self.topics.device_availability(&self.device);
+        self.publish(Publication::retained(topic, availability));
+
+        let status = StatePayload::status(self.present).retained(self.topics.status(&self.device));
+        self.publish(status);
+
+        // Its own sub-topic, so nothing is published for it before the first frame has arrived.
+        if let Some(stamp) = self.last_update.clone() {
+            let topic = self.topics.field(Source::Status, &self.device, LAST_UPDATE);
+            self.publish(StatePayload::last_update(&stamp).retained(topic));
+        }
+
+        if let Some(version) = self.firmware_version() {
+            let topic = self.topics.field(Source::Status, &self.device, FIRMWARE_VERSION);
+            self.publish(StatePayload::firmware_version(&version).retained(topic));
+        }
+    }
+
+    /// The device's full firmware version, once both halves of it have arrived.
+    ///
+    /// Four of its six fields are the octets of two telemetry registers and one comes from the identity
+    /// report, so this is the only value that needs both — which is why it is assembled here rather than
+    /// decoded in either. `None` until a frame and a report have each been seen, which is why it goes on a
+    /// topic of its own.
+    fn firmware_version(&self) -> Option<String> {
+        // The driver asks for the fields it needs by name; both places it might find them are here, and
+        // which register carries which part of a version is not this side's business.
+        self.driver.firmware_version(&|name: &str| {
+            // Bound rather than matched on: the borrow guard would otherwise live for the whole `if let`,
+            // and the telemetry borrow below overlaps it.
+            let reported = self
+                .session
+                .identity
+                .borrow()
+                .as_ref()
+                .and_then(|report| report.entries.iter().find(|entry| entry.name.as_deref() == Some(name)))
+                .map(|entry| entry.value.clone());
+            if let Some(value) = reported {
+                return Some(value);
+            }
+            // Read off the borrow rather than binding it, so the guard lives for the statement and no longer.
+            self.session
+                .telemetry
+                .borrow()
+                .as_ref()
+                .and_then(|view| reading(view, name))
+                .map(|raw| raw.to_string())
+        })
+    }
+
+    /// Publish the datalogger configuration worth showing.
+    fn publish_config(&mut self) {
+        let entries = self.session.identity.borrow().as_ref().map(|view| view.entries.clone());
+        let Some(entries) = entries else { return };
+        let payload = StatePayload::config(&entries, &self.fields);
+        if payload.is_empty() {
+            return;
+        }
+        // Retained, unlike telemetry: it arrives once per connect, so a subscriber joining mid-session
+        // would otherwise see nothing until the device reconnected.
+        self.publish(payload.retained(self.topics.config(&self.device)));
+    }
+
+    /// Publish one telemetry frame.
+    fn publish_telemetry(&mut self, view: &TelemetryView) {
+        let resting = self.rest.observe(view, Instant::now());
+        let payload = StatePayload::telemetry(view, &self.fields, resting);
+        if payload.is_empty() {
+            return;
+        }
+        let publication = payload.publication(self.topics.state(&self.device));
+        self.publish(publication);
+    }
+
+    /// Publish the settings a session has read back.
+    ///
+    /// Retained, unlike telemetry: a setting is not replaced on a cycle, so a subscriber that arrives
+    /// between two changes would otherwise see nothing until someone changed something.
+    fn publish_settings(&mut self) {
+        let payload = StatePayload::settings(&self.session.settings.borrow(), &self.fields);
+        if payload.is_empty() {
+            return;
+        }
+        let publication = payload.retained(self.topics.settings(&self.device));
+        self.publish(publication);
+    }
+
+    /// Publish each setting that cannot share the settings object, on a topic of its own.
+    ///
+    /// The shared object omits a field until the device has answered for it, and the settings cache fills
+    /// in over the half-minute a resync takes. An entity that validates its state — a `text` standing in
+    /// for the missing `time` component — would see an empty value on every publish before its own field
+    /// arrived, and Home Assistant logs an error rather than ignoring it. On its own topic nothing is
+    /// published until there is something to publish.
+    ///
+    /// The payload is still an object carrying the one field, so the entity's template is the same one
+    /// every other entity uses.
+    ///
+    /// The queue is written directly rather than through [`Self::publish`], because the settings borrow is
+    /// held across the loop; the guard that method applies is hoisted to the top instead.
+    fn publish_unshared_settings(&mut self) {
+        if self.published_for.is_none() {
+            return;
+        }
+        let Some(announced) = self.announced.as_ref() else {
+            return;
+        };
+        for setting in self.session.settings.borrow().iter() {
+            if !announced.indexed.unshared.contains(setting.name) {
+                continue;
+            }
+            let payload = StatePayload::settings(core::slice::from_ref(setting), &self.fields);
+            if payload.is_empty() {
+                continue;
+            }
+            let topic = self.topics.field(Source::Settings, &self.device, setting.name);
+            self.publications.try_publish(payload.retained(topic));
+        }
+    }
+
+    /// Publish, per gated entity, whether it currently has an honest value.
+    ///
+    /// Driven from the index rather than from a table here: an entity declares its own [`Gate`], and
+    /// [`Indexed`] turns those round so this walks the values that arrived and asks what each decides.
+    ///
+    /// **Only on change.** These are retained messages, and a gate is re-evaluated on every telemetry
+    /// frame — republishing an unchanged answer every five seconds would be a message per gate per cycle
+    /// for the life of the session.
+    ///
+    /// A gate whose deciding value has not arrived yet publishes *nothing*: it never appears in either
+    /// pass. Reporting a control available before knowing the work mode, or a reading valid before knowing
+    /// whether a meter is attached, would be a claim rather than an observation.
+    ///
+    /// Written directly to the queue for the same reason as [`Self::publish_unshared_settings`], with the
+    /// added one that the record of what was last said is updated as the pass goes.
+    fn publish_gates(&mut self) {
+        if self.published_for.is_none() {
+            return;
+        }
+        let Some(announced) = self.announced.as_ref() else {
+            return;
+        };
+        let indexed = &announced.indexed;
+
+        // Disjoint fields of `self`, which is what lets a borrow of the caches be held while `gates` and
+        // the queue are written. Each pass scopes its own borrow so neither is held across the other.
+        let gates = &mut self.gates;
+        let publications = &mut self.publications;
+        let topics = &self.topics;
+        let device = &self.device;
+
+        let mut say = |key: &'static str, open: bool| {
+            let payload = if open { ONLINE } else { OFFLINE };
+            if gates.get(key) == Some(&payload) {
+                return;
+            }
+            gates.insert(key, payload);
+            publications.try_publish(Publication::retained(topics.entity_availability(device, key), payload));
+        };
+
+        // Iterating straight off each borrow rather than binding it, so neither guard outlives its loop.
+        // One pass over the values that arrived, asking the index what each decides — where asking every
+        // gate to find its own value would scan all of them per gate, on a path that runs each frame.
+        for setting in self.session.settings.borrow().iter() {
+            let Some(dependents) = indexed.gated_by_setting.get(setting.name) else {
+                continue;
+            };
+            for (key, inert) in dependents {
+                say(key, !inert.contains(&setting.raw));
+            }
+        }
+
+        if let Some(view) = self.session.telemetry.borrow().as_ref() {
+            for reading in &view.readings {
+                let Some(dependents) = indexed.gated_by_reading.get(reading.name) else {
+                    continue;
+                };
+                for key in dependents {
+                    // The raw value rather than the rendered one: a flag is a flag, and parsing a scaled
+                    // string back into a number would fail on any reading that is not an integer.
+                    say(key, reading.raw != 0);
+                }
+            }
+        }
+    }
+
+    /// Queue a publication, unless there is nothing to publish over.
+    ///
+    /// The single gate on everything a link says. A device reports every five seconds whether or not the
+    /// broker is reachable, so without this an outage would fill the queue with messages that were
+    /// superseded long before it returned — and the first thing a new connection does is say everything
+    /// again anyway.
+    fn publish(&mut self, publication: Publication) {
+        if self.published_for.is_none() {
+            return;
+        }
+        self.publications.try_publish(publication);
+    }
+}
+
+/// Apply one change and log what the device made of it.
+///
+/// The outcome is not published from here. A write is followed by a read-back, which updates the session's
+/// settings cache, which the device's link is watching — so the value Home Assistant sees is the one the
+/// device actually holds, by the same path as any other settings change.
+async fn apply(session: &SessionHandle, device: &str, change: Change) {
+    let also_read = change.also_read();
+    tracing::info!(%device, setting = %change.key, "applying a command from Home Assistant");
+
+    // An action is transmitted and answered as sent. Putting it through `Apply` would wait for a read-back
+    // that the config space never produces, and report a working restart as a failure to confirm.
+    if change.delivery == Delivery::FireAndForget {
+        let requested = change.requested.clone();
+        let outcome = session.carry_out(ControlAction::Send(change.command)).await;
+        // Two arms per result rather than one with an `Option` field: an action carries no value, and
+        // `requested=None` beside a restart is noise. The value is logged here or nowhere — nothing reads
+        // these registers back, so this line is the only record of what the device was told.
+        match (outcome, requested) {
+            (Ok(_), Some(requested)) => {
+                tracing::info!(%device, action = %change.key, %requested, "sent");
+            }
+            (Ok(_), None) => tracing::info!(%device, action = %change.key, "sent"),
+            (Err(error), Some(requested)) => {
+                tracing::warn!(%device, action = %change.key, %requested, %error, "could not be sent");
+            }
+            (Err(error), None) => {
+                tracing::warn!(%device, action = %change.key, %error, "could not be sent");
+            }
+        }
+        return;
+    }
+
+    match session.carry_out(ControlAction::Apply(change.command)).await {
+        Ok(outcome) if outcome.confirmed => {
+            tracing::info!(%device, setting = %change.key, value = ?outcome.value, "the device stored it");
+        }
+        // Not an error: the device silently clamps rather than rejecting, and reporting what it *did* store
+        // is the whole reason a write is read back. Home Assistant will show the stored value.
+        Ok(outcome) => {
+            tracing::warn!(
+                %device,
+                setting = %change.key,
+                requested = ?outcome.requested,
+                stored = ?outcome.stored,
+                "the device did not store what was asked"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%device, setting = %change.key, %error, "the command could not be carried out");
+            return;
+        }
+    }
+
+    // A gating flag moves another register with it, with no write to that register at all. Read it rather
+    // than model the dependency, so the published value is the device's own.
+    if let Some(register) = also_read {
+        match session.carry_out(ControlAction::Refresh(register)).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    %device,
+                    register = register.number(),
+                    value = ?outcome.value,
+                    "re-read the register the flag gates"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %device,
+                    register = register.number(),
+                    %error,
+                    "could not re-read the register the flag gates; its published value may be stale"
+                );
+            }
+        }
+    }
+}
+
+/// One numeric reading out of a frame, by name.
+fn reading(view: &TelemetryView, name: &str) -> Option<u16> {
+    view.readings
+        .iter()
+        .find(|reading| reading.name == name)
+        .and_then(|reading| reading.value.parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, Publisher, PublisherOptions,
+        reading,
+    };
+    use crate::control::{
+        IdentityView, ReadingView, Registry, SessionHandle, SessionId, SettingView, StatusView, TelemetryView,
+    };
+    use crate::growatt::driver::Growatt;
+    use crate::homeassistant::rest::RestWatch;
+    use std::collections::HashMap;
+
+    use crate::growatt::v7::registers::{BATTERY_FIRST, SMART_SELF_USE, WORK_MODE_LABELS};
+    use crate::homeassistant::broker::{Broker, Event, Publication, Publications};
+    use crate::homeassistant::entity::LAST_UPDATE;
+    use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
+    use core::time::Duration;
+    use std::sync::Arc;
+    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::time::Instant;
+
+    /// The device's own serial in these tests, matching the one used across the documentation.
+    const DEVICE: &str = "0EXAMPLE00000001";
+
+    /// The device's availability topic, which is what a latched presence flag gets wrong.
+    const AVAILABILITY: &str = "heliobridge/0EXAMPLE00000001/availability";
+
+    /// The ends a session would hold, kept alive so nothing closes underneath the link.
+    struct Session {
+        telemetry: watch::Sender<Option<TelemetryView>>,
+        settings: watch::Sender<Vec<SettingView>>,
+        _identity: watch::Sender<Option<IdentityView>>,
+        _requests: mpsc::Receiver<crate::control::Request>,
+    }
+
+    /// Everything the link publishes into, drained by the test.
+    struct Wire {
+        published: mpsc::Receiver<Publication>,
+        generation: watch::Sender<Generation>,
+        farewells: mpsc::Receiver<(String, SessionId)>,
+        session: Session,
+    }
+
+    impl Wire {
+        /// Every message published so far, in order.
+        fn drain(&mut self) -> Vec<Publication> {
+            drained(&mut self.published)
+        }
+
+        /// Every message published to one topic.
+        fn on(&mut self, topic: &str) -> Vec<Publication> {
+            self.drain()
+                .into_iter()
+                .filter(|publication| publication.topic == topic)
+                .collect()
+        }
+    }
+
+    /// Every message published so far, in order.
+    fn drained(published: &mut mpsc::Receiver<Publication>) -> Vec<Publication> {
+        let mut out = Vec::new();
+        while let Ok(publication) = published.try_recv() {
+            out.push(publication);
+        }
+        out
+    }
+
+    /// The payload last published to one topic, if anything was.
+    ///
+    /// Draining consumes the queue, so this answers one question per call by design: two questions about
+    /// the same batch of messages are asked of a [`drained`] vector instead.
+    fn latest(published: &mut mpsc::Receiver<Publication>, topic: &str) -> Option<Vec<u8>> {
+        let messages = drained(published);
+        messages
+            .iter()
+            .rfind(|publication| publication.topic == topic)
+            .map(|publication| publication.payload.clone())
+    }
+
+    /// A link over channels a test controls, already running.
+    fn link(generation: Generation, options: PublisherOptions) -> Wire {
+        let (link, wire) = built_link(generation, options);
+        tokio::spawn(link.run());
+        wire
+    }
+
+    /// The same, before it is spawned — for the handful of assertions that are about a link's own state
+    /// rather than about what it publishes.
+    fn built_link(generation: Generation, options: PublisherOptions) -> (Link<Growatt>, Wire) {
+        let (publications, published) = Publications::channel(256);
+        let (telemetry, telemetry_rx) = watch::channel(None);
+        let (settings, settings_rx) = watch::channel(Vec::new());
+        let (identity, identity_rx) = watch::channel(None);
+        let (_status, status_rx) = watch::channel(StatusView::default());
+        let (requests, requests_rx) = mpsc::channel(4);
+        let (farewell, farewells) = mpsc::channel(FAREWELL_DEPTH);
+        let generation = watch::Sender::new(generation);
+
+        let link = Link {
+            driver: Arc::new(Growatt),
+            device: DEVICE.to_owned(),
+            session: SessionHandle {
+                requests,
+                settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
+                status: status_rx,
+                accessory: watch::channel(None).1,
+                stop: Arc::new(Notify::new()),
+            },
+            session_id: SessionId::sole(),
+            publications,
+            topics: Arc::new(Topics {
+                instance: "attic".to_owned(),
+                ..Topics::default()
+            }),
+            options,
+            generation: generation.subscribe(),
+            farewell,
+            published_for: None,
+            announced: None,
+            arrived: None,
+            last_update: None,
+            present: false,
+            fields: Fields::default(),
+            gates: HashMap::new(),
+            rest: RestWatch::default(),
+        };
+
+        let wire = Wire {
+            published,
+            generation,
+            farewells,
+            session: Session {
+                telemetry,
+                settings,
+                _identity: identity,
+                _requests: requests_rx,
+            },
+        };
+        (link, wire)
+    }
+
+    /// One session's ends, and the handle a registration would carry.
+    ///
+    /// Held together so that nothing closes underneath a link: a session's channels stay open for exactly
+    /// as long as the task that owns them, which is the whole reason a replaced link goes on waiting.
+    struct Ends {
+        telemetry: watch::Sender<Option<TelemetryView>>,
+        _settings: watch::Sender<Vec<SettingView>>,
+        _identity: watch::Sender<Option<IdentityView>>,
+        _status: watch::Sender<StatusView>,
+        _requests: mpsc::Receiver<crate::control::Request>,
+        handle: SessionHandle,
+    }
+
+    /// A session nothing is driving, as the server side would register it.
+    fn ends() -> Ends {
+        let (telemetry, telemetry_rx) = watch::channel(None);
+        let (settings, settings_rx) = watch::channel(Vec::new());
+        let (identity, identity_rx) = watch::channel(None);
+        let (status, status_rx) = watch::channel(StatusView::default());
+        let (requests, requests_rx) = mpsc::channel(4);
+        Ends {
+            telemetry,
+            _settings: settings,
+            _identity: identity,
+            _status: status,
+            _requests: requests_rx,
+            handle: SessionHandle {
+                requests,
+                settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
+                status: status_rx,
+                accessory: watch::channel(None).1,
+                stop: Arc::new(Notify::new()),
+            },
+        }
+    }
+
+    /// A publisher over a broker that goes nowhere, with the registry sessions register into.
+    ///
+    /// Built by hand rather than through [`Publisher::start`], which wants a broker to connect to. What
+    /// these tests drive is the reconciliation between the registry and the links, so the broker only has
+    /// to hold a queue.
+    fn publisher() -> (Publisher<Growatt>, Registry, mpsc::Receiver<Publication>) {
+        let (broker, queue) = Broker::detached();
+        let (farewell, ended) = mpsc::channel(FAREWELL_DEPTH);
+        let registry = Registry::new();
+        let devices = registry.watch();
+        let publisher = Publisher {
+            driver: Arc::new(Growatt),
+            broker,
+            topics: Arc::new(Topics {
+                instance: "attic".to_owned(),
+                ..Topics::default()
+            }),
+            registry: registry.clone(),
+            options: PublisherOptions::default(),
+            devices,
+            generation: watch::Sender::new(Generation::default()),
+            linked: HashMap::new(),
+            farewell,
+            ended,
+        };
+        (publisher, registry, queue)
+    }
+
+    /// Let the link run until it is waiting again.
+    ///
+    /// Time is paused in these tests, so there is nothing to wait *for* — only the scheduler to give the
+    /// task its turn, which the timer advance below also does.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// One telemetry frame, with the fields these tests read.
+    fn frame(power: &str) -> TelemetryView {
+        TelemetryView {
+            timestamp: None,
+            readings: vec![
+                ReadingView {
+                    register: 5,
+                    name: "ac_power",
+                    raw: 30_000,
+                    value: power.to_owned(),
+                    unit: "W",
+                    confidence: "verified",
+                },
+                ReadingView {
+                    register: 12,
+                    name: "battery_pack_count",
+                    raw: 1,
+                    value: "1".to_owned(),
+                    unit: "",
+                    confidence: "observed",
+                },
+            ],
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_started_after_the_broker_connected_still_announces_itself() {
+        // The device connects after the broker does, so a link subscribes to the generation only once it is
+        // already current — and `changed()` reports nothing that happened before. Waiting for a change
+        // would mean waiting for the broker to drop.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+
+        let discovery: Vec<Publication> = wire
+            .drain()
+            .into_iter()
+            .filter(|publication| publication.topic.starts_with("homeassistant/"))
+            .collect();
+        assert!(discovery.len() > 40, "announced only {} entities", discovery.len());
+        assert!(discovery.iter().all(|publication| publication.retain));
+        assert!(discovery.iter().any(
+            |publication| publication.topic == "homeassistant/sensor/heliobridge/0EXAMPLE00000001_ac_power/config"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn entities_a_previous_run_announced_are_withdrawn() {
+        // The broker keeps discovery messages, so a run configured for nine slots leaves entities behind
+        // that a run configured for one must take away — as does one that announced four battery packs
+        // before the device said it has one. An empty retained payload is how that is done; without it the
+        // entity stays on the device page with a state nothing will ever publish again.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+
+        let withdrawn: Vec<Publication> = wire
+            .drain()
+            .into_iter()
+            .filter(|publication| publication.topic.starts_with("homeassistant/") && publication.payload.is_empty())
+            .collect();
+        assert!(
+            withdrawn.iter().any(|publication| {
+                publication.topic == "homeassistant/sensor/heliobridge/0EXAMPLE00000001_battery4_temp/config"
+            }),
+            "a fourth battery pack was never in this catalogue and must be taken away"
+        );
+        assert!(
+            withdrawn.iter().any(|publication| {
+                publication.topic == "homeassistant/number/heliobridge/0EXAMPLE00000001_slot9_output_power/config"
+            }),
+            "only one slot is exposed, so the ninth must be taken away"
+        );
+        assert!(
+            withdrawn.iter().all(|publication| publication.retain),
+            "a withdrawal has to replace the retained message, so it must be retained itself"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pack_the_device_reports_is_announced_rather_than_withdrawn() {
+        // The other direction, and the reason one pack is assumed before the device has said: a pack that
+        // appears only adds entities, where a pack that was never there has to be taken away again.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        let mut two_packs = frame("-100");
+        if let Some(count) = two_packs
+            .readings
+            .iter_mut()
+            .find(|reading| reading.name == "battery_pack_count")
+        {
+            count.value = "2".to_owned();
+        }
+        wire.session.telemetry.send_replace(Some(two_packs));
+        settle().await;
+
+        let announced = wire.on("homeassistant/sensor/heliobridge/0EXAMPLE00000001_battery2_temp/config");
+        let published = announced.last().expect("the second pack should be announced");
+        assert!(!published.payload.is_empty(), "announced, not withdrawn");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_publishes_nothing_until_the_broker_has_been_reached() {
+        // Otherwise the queue fills with a discovery burst nobody can deliver, and what does arrive when
+        // the broker returns was superseded while it was away.
+        let mut wire = link(Generation::default(), PublisherOptions::default());
+        settle().await;
+        assert!(wire.drain().is_empty(), "published before the broker was reachable");
+
+        // A frame arriving in the meantime is still not published.
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert!(wire.drain().is_empty());
+
+        // And the first connection says everything, including what arrived while it was down.
+        wire.generation.send_modify(|current| *current = current.next());
+        settle().await;
+        let published = wire.drain();
+        assert!(
+            published
+                .iter()
+                .any(|publication| publication.topic.starts_with("homeassistant/")),
+            "the first connection should announce the entities"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_device_is_reported_present_on_its_first_frame_and_not_before() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        let availability = "heliobridge/0EXAMPLE00000001/availability";
+        assert_eq!(
+            wire.on(availability)
+                .last()
+                .map(|publication| publication.payload.clone()),
+            Some(b"offline".to_vec()),
+            "a connected device that has not reported yet has no readings to offer"
+        );
+
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(
+            wire.on(availability)
+                .last()
+                .map(|publication| publication.payload.clone()),
+            Some(b"online".to_vec())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_is_published_as_transient_state_carrying_its_fields() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+
+        let state = wire.on("heliobridge/0EXAMPLE00000001/state");
+        let published = state.first().expect("a state message");
+        assert!(!published.retain, "state is replaced within seconds");
+        let object: serde_json::Value = serde_json::from_slice(&published.payload).expect("valid JSON");
+        assert_eq!(object["ac_power"], serde_json::json!(-100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn going_quiet_reports_the_device_absent_and_publishes_no_substitute() {
+        // The rule the Energy dashboard depends on: no zero, no repeat of the last value. A zero on a
+        // `total_increasing` counter reads as a reset, and the next real value is counted as new energy.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        wire.drain();
+
+        tokio::time::advance(OFFLINE_AFTER.saturating_sub(Duration::from_secs(1))).await;
+        settle().await;
+        assert!(wire.drain().is_empty(), "one late frame is not an outage");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let published = wire.drain();
+        assert_eq!(
+            published
+                .iter()
+                .find(|publication| publication.topic.ends_with("/availability"))
+                .map(|publication| publication.payload.clone()),
+            Some(b"offline".to_vec())
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|publication| publication.topic.ends_with("/state")),
+            "nothing may be published as the device's current reading"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_device_already_reported_absent_arms_no_further_go_quiet_timer() {
+        // The deadline is recomputed on every pass round the link's loop and `went_quiet` leaves
+        // `arrived` alone, so keeping it armed after it has fired re-arms it on an instant already
+        // behind us -- which completes as soon as it is awaited and spins the link on a core.
+        //
+        // Asserted on the deadline rather than on what is published, because the spin is invisible from
+        // outside: `went_quiet` is idempotent, so the second pass says nothing, and the other branches
+        // are still served correctly. Nor can a test catch it by timing. Tokio's cooperative budget makes
+        // the loop yield every ~128 turns, so the runtime keeps making progress and paused time still
+        // advances; the only symptom is the CPU.
+        let (mut link, _wire) = built_link(Generation::default().next(), PublisherOptions::default());
+
+        assert_eq!(
+            link.quiet_at(),
+            None,
+            "nothing has arrived, so there is nothing to time"
+        );
+
+        link.arrived = Some(Instant::now());
+        link.present = true;
+        assert!(
+            link.quiet_at().is_some(),
+            "a device that is reporting is timed out of presence"
+        );
+
+        link.went_quiet();
+        assert!(!link.present, "the point of the timer firing");
+        assert_eq!(link.quiet_at(), None, "and nothing is armed to fire again");
+
+        link.arrived = Some(Instant::now());
+        link.present = true;
+        assert!(link.quiet_at().is_some(), "a device that comes back is timed again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_staleness_of_a_reading_stays_answerable_while_the_device_is_absent() {
+        // Status carries the last update and is retained, so the one sensor that keeps working through an
+        // outage says how old the readings on the dashboard are.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        tokio::time::advance(OFFLINE_AFTER.saturating_add(Duration::from_secs(1))).await;
+        settle().await;
+
+        // Drained once, because draining consumes the queue.
+        let published = wire.drain();
+        let latest = |topic: &str| {
+            published
+                .iter()
+                .rfind(|publication| publication.topic == topic)
+                .cloned()
+        };
+
+        let status = latest("heliobridge/0EXAMPLE00000001/status").expect("a status message");
+        assert!(status.retain, "nothing will republish it while the device is away");
+        let object: serde_json::Value = serde_json::from_slice(&status.payload).expect("valid JSON");
+        assert_eq!(object["connected"], "offline");
+
+        // The stamp is retained on a sub-topic of its own, so it outlives the device the same way.
+        let stamped = latest("heliobridge/0EXAMPLE00000001/status/last_update").expect("a stamp");
+        assert!(stamped.retain, "nothing will republish it while the device is away");
+        let object: serde_json::Value = serde_json::from_slice(&stamped.payload).expect("valid JSON");
+        assert!(
+            object[LAST_UPDATE].is_string(),
+            "the timestamp of the last frame outlives the device"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_published_for_the_stamp_before_a_frame_arrives() {
+        // An absent field templates to an empty state, which Home Assistant logs as invalid rather than
+        // ignoring — so the stamp says nothing at all until there is something to say.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+
+        // One drain, then both questions asked of it: draining twice would empty the queue and make the
+        // second assertion pass for the wrong reason.
+        let published = wire.drain();
+        let sent_to = |topic: &str| published.iter().any(|publication| publication.topic == topic);
+
+        assert!(
+            sent_to("heliobridge/0EXAMPLE00000001/status"),
+            "the shared status object is published from the start"
+        );
+        assert!(
+            !sent_to("heliobridge/0EXAMPLE00000001/status/last_update"),
+            "no frame has arrived, so there is no stamp"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnecting_broker_is_told_everything_again() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        wire.drain();
+
+        wire.generation.send_modify(|current| *current = current.next());
+        settle().await;
+
+        let published = wire.drain();
+        let announced = published
+            .iter()
+            .filter(|publication| publication.topic.starts_with("homeassistant/"))
+            .count();
+        assert!(announced > 40, "only {announced} entities were announced again");
+        assert!(
+            published
+                .iter()
+                .any(|publication| publication.topic.ends_with("/state")),
+            "a frame that is still current is state, so it is published again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_frame_is_not_republished_as_current_state() {
+        // A broker that returns after the device went quiet must not be handed the reading from before the
+        // outage. It is the same frame, and it is no longer true.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        tokio::time::advance(OFFLINE_AFTER.saturating_add(Duration::from_secs(1))).await;
+        settle().await;
+        wire.drain();
+
+        wire.generation.send_modify(|current| *current = current.next());
+        settle().await;
+
+        let published = wire.drain();
+        assert!(
+            !published
+                .iter()
+                .any(|publication| publication.topic.ends_with("/state")),
+            "the frame from before the outage is not current state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settings_are_retained_because_nothing_republishes_them_on_a_cycle() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 326,
+            name: "grid_power_allowed",
+            raw: 1,
+            value: "1".to_owned(),
+            unit: "",
+        }]);
+        settle().await;
+
+        let settings = wire.on("heliobridge/0EXAMPLE00000001/settings");
+        let published = settings.last().expect("a settings message");
+        assert!(published.retain);
+        let object: serde_json::Value = serde_json::from_slice(&published.payload).expect("valid JSON");
+        assert_eq!(object["grid_power_allowed"], serde_json::json!(1));
+    }
+
+    /// The slot power setting and the work mode that decides whether it is read.
+    fn slot1(work_mode: u16) -> Vec<SettingView> {
+        vec![
+            SettingView {
+                register: 256,
+                name: "slot1_work_mode",
+                raw: work_mode,
+                value: WORK_MODE_LABELS
+                    .get(usize::from(work_mode))
+                    .expect("a known mode")
+                    .to_string(),
+                unit: "",
+            },
+            SettingView {
+                register: 257,
+                name: "slot1_output_power",
+                raw: 300,
+                value: "300".to_owned(),
+                unit: "W",
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_validated_setting_is_not_published_before_the_device_has_answered_for_it() {
+        // The settings cache fills in one register at a time over a resync, so the shared object is
+        // partial for the first half-minute. A `text` entity checks its value against the length and
+        // pattern it was announced with and an empty string fails both, so Home Assistant logs an error
+        // for a value it was never sent. Its own topic stays silent until there is something to say.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 250,
+            name: "charge_limit_upper",
+            raw: 100,
+            value: "100".to_owned(),
+            unit: "%",
+        }]);
+        settle().await;
+
+        assert!(
+            !wire.on("heliobridge/0EXAMPLE00000001/settings").is_empty(),
+            "the shared object still carries what has arrived"
+        );
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/settings/slot1_start_time")
+                .is_empty(),
+            "nothing should be published for a setting the device has not answered for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_validated_setting_gets_a_topic_of_its_own_once_it_arrives() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 254,
+            name: "slot1_start_time",
+            raw: 0,
+            value: "00:00".to_owned(),
+            unit: "",
+        }]);
+        settle().await;
+
+        let published = wire.on("heliobridge/0EXAMPLE00000001/settings/slot1_start_time");
+        let last = published.last().expect("a message on its own topic");
+        assert!(last.retain, "a setting is retained wherever it is published");
+        let object: serde_json::Value = serde_json::from_slice(&last.payload).expect("valid JSON");
+        // An object carrying the one field, so the entity's template is the same as every other entity's.
+        assert_eq!(object["slot1_start_time"], serde_json::json!("00:00"));
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_smart_self_use_takes_its_power_setting_unavailable() {
+        // The device stores the value and ignores it, reading back exactly what was written — so nothing
+        // in the write itself reveals that it did nothing. Availability is the only channel that can.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(SMART_SELF_USE));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        let published = gate.last().expect("a gate message");
+        assert!(
+            published.retain,
+            "a subscriber joining later must still learn it is inert"
+        );
+        assert_eq!(published.payload, OFFLINE);
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_battery_first_takes_its_power_setting_unavailable() {
+        // The same reasoning as smart self-use, and for the same line of sub-MCU code: the slot's own
+        // power is passed onward only in `load_first`. Battery first was missed when the gate was first
+        // written, so a dashboard offered a live control that the device discards.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(BATTERY_FIRST));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        assert_eq!(gate.last().expect("a gate message").payload, OFFLINE);
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_load_first_keeps_its_power_setting_available() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(0));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        assert_eq!(gate.last().expect("a gate message").payload, ONLINE);
+    }
+
+    #[tokio::test]
+    async fn a_setting_nothing_overrides_gets_no_gate_topic() {
+        // Only the overridable ones carry an extra topic. Publishing one per setting would announce a
+        // condition that does not exist, and every entity would then depend on a topic nothing drives.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 326,
+            name: "grid_power_allowed",
+            raw: 1,
+            value: "1".to_owned(),
+            unit: "",
+        }]);
+        settle().await;
+
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/availability/grid_power_allowed")
+                .is_empty(),
+            "grid_power_allowed is not superseded by anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_waits_for_the_deciding_setting_to_be_read_back() {
+        // Reporting the control available before the work mode is known would be a claim rather than an
+        // observation, and the wrong one half the time.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 257,
+            name: "slot1_output_power",
+            raw: 300,
+            value: "300".to_owned(),
+            unit: "W",
+        }]);
+        settle().await;
+
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power")
+                .is_empty(),
+            "nothing should be claimed until slot1_work_mode has been read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_device_that_reconnects_while_its_old_session_lingers_is_linked_to_the_new_one() {
+        // The bug this guards against, seen twice in service. A link watches *one* session's channels, and
+        // the registry replaces the session behind a serial on every reconnect while the replaced
+        // session's task keeps its channels open — measured at ten minutes on a half-open socket. Keying
+        // the links on the serial alone left the dead link holding the device and published nothing at all
+        // for the session actually serving it, so Home Assistant kept the last thing it had been told:
+        // `offline`, once the watchdog had fired.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        // What a broker connection does: establish the generation, then link whatever is connected.
+        publisher.handle(Event::Connected);
+        settle().await;
+        drained(&mut queue);
+
+        // The device comes back on a new session while the old one is still open.
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        assert!(
+            publisher.devices.has_changed().expect("the registry outlives this"),
+            "a reconnect must wake the publisher, though the same one device is connected before and after"
+        );
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        settle().await;
+        drained(&mut queue);
+
+        // A frame on the session that is actually serving the device.
+        second.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY).as_deref(),
+            Some(ONLINE),
+            "the device is reporting on its new session, so it is present"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_link_of_a_replaced_session_is_stopped_rather_than_left_publishing() {
+        // Both links publish to the same topics, so one left on a replaced session would let a dead
+        // session's idea of the device overwrite the live one's — including the `offline` it latched when
+        // that socket went quiet.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        settle().await;
+        drained(&mut queue);
+
+        // Whatever still arrives on the replaced session is not the device speaking.
+        first.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY),
+            None,
+            "nothing should be published for a session that has been replaced"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_farewell_of_a_replaced_session_leaves_the_live_link_alone() {
+        // The old socket closes minutes after the device has come back on a new one. That farewell is news
+        // about a session nothing is watching, not about the device, and acting on it would report the
+        // device gone while its own link is publishing frames.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let (replaced, _) = registry.session(DEVICE).expect("the session just registered");
+
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        second.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        drained(&mut queue);
+
+        publisher.session_ended(DEVICE, replaced);
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY),
+            None,
+            "a replaced session's farewell must not be published as the device going away"
+        );
+        assert!(
+            publisher.linked.contains_key(DEVICE),
+            "the link for the session serving the device must survive it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_farewell_of_the_current_session_reports_the_device_gone() {
+        // The other half of the same rule: a farewell from the session that *is* serving the device is the
+        // device going away, and its readings are reported gone rather than left at their last value.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let only = ends();
+        let registration = registry.register(DEVICE, only.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let (session, _) = registry.session(DEVICE).expect("the session just registered");
+        only.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        drained(&mut queue);
+
+        // The session that ended is gone from the registry too, which is what makes this the device
+        // leaving rather than the device reconnecting.
+        drop(registration);
+        publisher.session_ended(DEVICE, session);
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY).as_deref(),
+            Some(OFFLINE),
+            "the session serving the device ended, so the device is gone"
+        );
+        assert!(!publisher.linked.contains_key(DEVICE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_is_started_once_for_a_session_however_often_the_registry_is_announced() {
+        // The reconciliation runs on anything that might have changed, including a broker reconnecting, so
+        // it has to be idempotent: a second link for the same session would double every message.
+        let (mut publisher, registry, _queue) = publisher();
+
+        let only = ends();
+        let _registration = registry.register(DEVICE, only.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let linked = publisher
+            .linked
+            .get(DEVICE)
+            .expect("the device should be linked")
+            .session;
+
+        publisher.link_devices();
+        publisher.link_devices();
+        settle().await;
+        assert_eq!(
+            publisher.linked.get(DEVICE).map(|linked| linked.session),
+            Some(linked),
+            "the same session should still hold the one link that was started for it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_ending_is_reported_to_the_publisher_rather_than_announced_here() {
+        // The publisher owns the availability topic on this path, so the same message is not published from
+        // two places — and so it is still published if the link is torn down instead of ending.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+
+        drop(wire.session);
+        settle().await;
+        assert_eq!(
+            wire.farewells.try_recv().ok(),
+            Some((DEVICE.to_owned(), SessionId::sole())),
+            "the farewell names the session too, so one arriving late can be told from the current one"
+        );
+    }
+
+    #[test]
+    fn nothing_is_published_before_the_broker_has_ever_been_reached() {
+        // Otherwise a discovery burst is queued at a broker that is down, and by the time it comes back the
+        // queue holds messages that were superseded while it was away.
+        assert!(!Generation::default().is_established());
+        assert!(Generation::default().next().is_established());
+    }
+
+    #[test]
+    fn every_broker_connection_is_a_new_generation() {
+        // What makes a link say everything again. Equality is the whole mechanism: a link republishes when
+        // the value it holds differs from the current one.
+        let first = Generation::default().next();
+        let second = first.next();
+        assert_ne!(first, second);
+        assert!(second > first);
+    }
+
+    #[test]
+    fn the_watchdog_is_six_telemetry_cycles() {
+        // Long enough not to declare the device dead on one late frame, short enough that a half-open
+        // connection does not leave stale readings on a dashboard for the device's 420-second keepalive.
+        assert_eq!(OFFLINE_AFTER.as_secs(), 30);
+        assert_eq!(PublisherOptions::default().offline_after, OFFLINE_AFTER);
+        assert_eq!(PublisherOptions::default().slots, 1);
+        assert!(PublisherOptions::default().permitted.writes);
+    }
+
+    #[test]
+    fn the_pack_count_is_read_out_of_the_frame_that_carries_it() {
+        // What decides whether a second battery's entities exist at all.
+        let view = TelemetryView {
+            timestamp: None,
+            readings: vec![ReadingView {
+                register: 12,
+                name: "battery_pack_count",
+                raw: 2,
+                value: "2".to_owned(),
+                unit: "",
+                confidence: "observed",
+            }],
+        };
+        assert_eq!(reading(&view, "battery_pack_count"), Some(2));
+        assert_eq!(reading(&view, "ac_power"), None);
+    }
+
+    #[test]
+    fn a_retired_entity_is_withdrawn_even_though_the_catalogue_forgot_it() {
+        // The case the retired list exists for: an entity deleted from the code, so it appears in neither
+        // what is being kept nor what the catalogue can describe. Without the list nothing would ever
+        // retract its retained discovery message.
+        let keeping = Catalogue::everything(&Growatt);
+        let retired = [(Component::Sensor, "a_deleted_sensor")];
+
+        let gone = Link::<Growatt>::retractions(&[], &keeping, &retired);
+        assert!(
+            gone.contains(&(Component::Sensor, "a_deleted_sensor")),
+            "a retired entity must be retracted: {gone:?}"
+        );
+    }
+
+    #[test]
+    fn a_retired_key_that_came_back_is_not_withdrawn() {
+        // Reusing a key would otherwise retract the live entity moments after announcing it.
+        let revived = Catalogue::everything(&Growatt)
+            .into_iter()
+            .find(|entity| entity.component == Component::Sensor)
+            .expect("a sensor exists");
+        let retired = [(revived.component, revived.key)];
+
+        let gone = Link::<Growatt>::retractions(&[], core::slice::from_ref(&revived), &retired);
+        assert!(
+            !gone.contains(&(revived.component, revived.key)),
+            "a key in use must not be retracted: {gone:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_switch_left_as_a_sensor_by_an_older_release_is_withdrawn() {
+        // Up to 0.8.x a switch that could not be written was announced as a sensor, which Home Assistant
+        // refused; it is a binary sensor now, so its old topic is one nothing produces any more. Every
+        // slot's switch included, not only the slots this run exposes.
+        let keeping = Catalogue::everything(&Growatt);
+        let gone = Link::<Growatt>::retractions(&[], &keeping, &Catalogue::retired(&Growatt));
+        for key in ["always_on", "power_plus", "slot1_enabled", "slot9_enabled"] {
+            assert!(
+                gone.contains(&(Component::Sensor, key)),
+                "sensor/{key} is left behind: {gone:?}"
+            );
+        }
+        // The sensors that are still sensors stay.
+        assert!(!gone.contains(&(Component::Sensor, "slot1_output_power")), "{gone:?}");
+    }
+
+    #[test]
+    fn the_shipped_retired_list_names_nothing_still_published() {
+        // An entry left in place after its key was reintroduced would silently retract a live entity on
+        // every reconnect.
+        let live = Catalogue::everything(&Growatt);
+        for (component, key) in Catalogue::retired(&Growatt) {
+            assert!(
+                !live
+                    .iter()
+                    .any(|entity| entity.key == key && entity.component == component),
+                "{component}/{key} is both retired and published"
+            );
+        }
+    }
+}

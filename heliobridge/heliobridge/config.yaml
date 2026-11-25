@@ -1,0 +1,42 @@
+name: Heliobridge
+version: "0.9.1.1"
+slug: heliobridge
+description: Local TLS/MQTT bridge for a Growatt NEXA 2000 with Home Assistant MQTT Discovery
+url: "https://github.com/braumandl/heliobridge-haos"
+arch:
+  - amd64
+startup: application
+init: false
+services:
+  - mqtt:need
+ports:
+  7006/tcp: 7006
+ports_description:
+  7006/tcp: NEXA 2000 MQTT-over-TLS listener
+watchdog: "tcp://[HOST]:[PORT:7006]"
+options:
+  allow_writes: false
+  allow_power_plus: false
+  cloud_relay: false
+  relay_mode: controls
+  allow_from: ""
+  allow_devices: ""
+  slots: 1
+  offline_after: 30
+  mqtt_base: heliobridge
+  mqtt_discovery_prefix: homeassistant
+  timezone: Europe/Berlin
+  log_level: info
+schema:
+  allow_writes: bool
+  allow_power_plus: bool
+  cloud_relay: bool
+  relay_mode: list(full|controls|observer)
+  allow_from: str?
+  allow_devices: str?
+  slots: int(1,9)
+  offline_after: int(1,3600)
+  mqtt_base: str(1,128)
+  mqtt_discovery_prefix: str(1,128)
+  timezone: str(1,64)
+  log_level: str(1,512)
